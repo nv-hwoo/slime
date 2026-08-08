@@ -121,6 +121,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # Delta weight sync.
             parser.add_argument(
+                "--update-weight-backend",
+                choices=["native", "modelexpress"],
+                default="native",
+                help="Select the native updater or the ModelExpress canonical S3 lifecycle.",
+            )
+            parser.add_argument("--modelexpress-model-id", type=str, default=None)
+            parser.add_argument("--modelexpress-catalog-endpoint", type=str, default=None)
+            parser.add_argument("--modelexpress-s3-endpoint", type=str, default=None)
+            parser.add_argument("--modelexpress-s3-bucket", type=str, default=None)
+            parser.add_argument("--modelexpress-s3-prefix", type=str, default="")
+            parser.add_argument("--modelexpress-preparation-cache-dir", type=str, default=None)
+            parser.add_argument("--modelexpress-initial-version", type=str, default="0")
+            parser.add_argument("--modelexpress-ready-timeout-seconds", type=float, default=600.0)
+            parser.add_argument(
                 "--update-weight-mode",
                 choices=["full", "delta"],
                 default="full",
@@ -2028,6 +2042,31 @@ def slime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.update_weight_backend == "modelexpress":
+        required = {
+            "--modelexpress-model-id": args.modelexpress_model_id,
+            "--modelexpress-catalog-endpoint": args.modelexpress_catalog_endpoint,
+            "--modelexpress-s3-bucket": args.modelexpress_s3_bucket,
+            "--modelexpress-preparation-cache-dir": args.modelexpress_preparation_cache_dir,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"ModelExpress requires {', '.join(missing)}")
+        if args.rollout_external:
+            raise ValueError("ModelExpress V0 does not support external rollout engines")
+        if args.release_train:
+            raise ValueError("ModelExpress V0 does not support --release-train")
+        if getattr(args, "lora_rank", 0) > 0:
+            raise ValueError("ModelExpress V0 does not support LoRA weight updates")
+        if args.modelexpress_initial_version != "0":
+            raise ValueError("ModelExpress V0 requires --modelexpress-initial-version=0")
+        if args.modelexpress_ready_timeout_seconds <= 0:
+            raise ValueError("--modelexpress-ready-timeout-seconds must be positive")
+        if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:
+            raise ValueError("ModelExpress does not use native disk weight-update directories")
+        if args.custom_update_weight_post_write_path:
+            raise ValueError("ModelExpress does not use --custom-update-weight-post-write-path")
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:
