@@ -19,7 +19,11 @@ def create_weight_updater(
     update_weight_mode = args.update_weight_mode
     update_weight_transport = args.update_weight_transport
 
-    if update_weight_mode == "delta":
+    if args.update_weight_backend == "modelexpress":
+        from .update_weight_from_modelexpress import UpdateWeightFromModelExpress
+
+        update_weight_cls = UpdateWeightFromModelExpress
+    elif update_weight_mode == "delta":
         # Delta sync is disk-transport only: each engine's /pull_weights applies the published
         # deltas into a host-local checkpoint on every host it spans, and the engines reload
         # via vanilla update_weights_from_disk.
