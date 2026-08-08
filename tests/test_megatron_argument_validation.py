@@ -251,10 +251,20 @@ def make_slime_validate_args(**overrides):
         keep_old_actor=False,
         only_train_params_name_list=None,
         freeze_params_name_list=None,
+        update_weight_backend="native",
         update_weight_transport="nccl",
         update_weight_disk_dir=None,
         update_weight_local_checkpoint_dir=None,
         update_weight_mode="full",
+        custom_update_weight_post_write_path=None,
+        modelexpress_model_id=None,
+        modelexpress_catalog_endpoint=None,
+        modelexpress_s3_bucket=None,
+        modelexpress_preparation_cache_dir=None,
+        modelexpress_initial_version="0",
+        modelexpress_ready_timeout_seconds=600.0,
+        rollout_external=False,
+        lora_rank=0,
         rollout_temperature=1.0,
     )
     values.update(overrides)
@@ -393,6 +403,30 @@ def test_update_weight_delta_requires_local_checkpoint_dir(monkeypatch):
 
     with pytest.raises(ValueError, match="requires --update-weight-local-checkpoint-dir"):
         module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_modelexpress_requires_its_stable_configuration(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(update_weight_backend="modelexpress")
+
+    with pytest.raises(ValueError, match="modelexpress-model-id"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_modelexpress_does_not_require_native_disk_configuration(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        update_weight_backend="modelexpress",
+        modelexpress_model_id="policy",
+        modelexpress_catalog_endpoint="dns:///catalog:50051",
+        modelexpress_s3_bucket="weights",
+        modelexpress_preparation_cache_dir="/mxdelta/mxprep",
+    )
+
+    del args.lora_rank
+    module.slime_validate_args(args)
 
 
 if __name__ == "__main__":

@@ -242,6 +242,25 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return True
 
+    def prepare_weights_from_modelexpress(self, target_version: str):
+        return self._make_request(
+            "prepare_weights_from_modelexpress",
+            {"target_version": target_version},
+        )
+
+    def update_weights_from_modelexpress(self, target_version: str):
+        return self._make_request(
+            "update_weights_from_modelexpress",
+            {"target_version": target_version},
+        )
+
+    def get_modelexpress_status(self):
+        if self.node_rank != 0:
+            return None
+        response = requests.get(f"http://{self.server_host}:{self.server_port}/get_modelexpress_status")
+        response.raise_for_status()
+        return response.json()
+
     def update_weights_from_tensor(
         self,
         serialized_named_tensors: list[str],
@@ -574,6 +593,26 @@ def _compute_server_args(
 
     server_arg_fields = dataclasses.fields(ServerArgs)
     server_arg_field_names = {attr.name for attr in server_arg_fields}
+    if getattr(args, "update_weight_backend", "native") == "modelexpress":
+        required_fields = {
+            "modelexpress_model_id",
+            "modelexpress_catalog_endpoint",
+            "modelexpress_delta_s3_endpoint",
+            "modelexpress_initial_version",
+            "modelexpress_ready_timeout_seconds",
+            "modelexpress_preparation_cache_dir",
+        }
+        missing_fields = required_fields - server_arg_field_names
+        if missing_fields:
+            raise RuntimeError("SGLang lacks ModelExpress support: " + ", ".join(sorted(missing_fields)))
+        kwargs.update(
+            modelexpress_model_id=args.modelexpress_model_id,
+            modelexpress_catalog_endpoint=args.modelexpress_catalog_endpoint,
+            modelexpress_delta_s3_endpoint=args.modelexpress_s3_endpoint,
+            modelexpress_initial_version=args.modelexpress_initial_version,
+            modelexpress_ready_timeout_seconds=args.modelexpress_ready_timeout_seconds,
+            modelexpress_preparation_cache_dir=args.modelexpress_preparation_cache_dir,
+        )
     unused_keys = set(kwargs.keys())
     for attr in server_arg_fields:
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":

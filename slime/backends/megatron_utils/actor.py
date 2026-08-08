@@ -46,9 +46,6 @@ from .loss import (
 )
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
-from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
-from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -152,7 +149,11 @@ class MegatronTrainRayActor(TrainRayActor):
         update_weight_mode = self.args.update_weight_mode
         update_weight_transport = self.args.update_weight_transport
 
-        if update_weight_mode == "delta":
+        if self.args.update_weight_backend == "modelexpress":
+            from .update_weight.update_weight_from_modelexpress import UpdateWeightFromModelExpress
+
+            update_weight_cls = UpdateWeightFromModelExpress
+        elif update_weight_mode == "delta":
             # Delta sync is disk-transport only: each engine's /pull_weights applies the published
             # deltas into a host-local checkpoint on every host it spans, and the engines reload
             # via vanilla update_weights_from_disk.
@@ -164,14 +165,20 @@ class MegatronTrainRayActor(TrainRayActor):
 
             update_weight_cls = UpdateWeightFromDiskDelta
         elif update_weight_transport == "disk":
+            from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
+
             update_weight_cls = UpdateWeightFromDisk
         elif self.args.colocate:
+            from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+
             update_weight_cls = UpdateWeightFromTensor
         else:
             assert update_weight_mode == "full"
             assert (
                 update_weight_transport == "nccl"
             ), f"unsupported weight sync mode/transport: {update_weight_mode!r}/{update_weight_transport!r}"
+            from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
+
             update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
