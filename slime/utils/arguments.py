@@ -2062,13 +2062,13 @@ def slime_validate_args(args):
         if missing:
             raise ValueError(f"ModelExpress requires {', '.join(missing)}")
         if args.rollout_external:
-            raise ValueError("ModelExpress V0 does not support external rollout engines")
+            raise ValueError("ModelExpress does not support external rollout engines")
         if args.release_train:
-            raise ValueError("ModelExpress V0 does not support --release-train")
+            raise ValueError("ModelExpress does not support --release-train")
         if getattr(args, "lora_rank", 0) > 0:
-            raise ValueError("ModelExpress V0 does not support LoRA weight updates")
+            raise ValueError("ModelExpress does not support LoRA weight updates")
         if args.modelexpress_initial_version != "0":
-            raise ValueError("ModelExpress V0 requires --modelexpress-initial-version=0")
+            raise ValueError("ModelExpress requires --modelexpress-initial-version=0")
         if args.modelexpress_ready_timeout_seconds <= 0:
             raise ValueError("--modelexpress-ready-timeout-seconds must be positive")
         if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:

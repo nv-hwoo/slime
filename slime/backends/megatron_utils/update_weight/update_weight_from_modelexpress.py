@@ -21,7 +21,7 @@ class ModelExpressUpdateError(RuntimeError):
     pass
 
 
-def _require_success(result: Mapping[str, Any], *, operation: str, target_version: str) -> None:
+def _require_success(result: Mapping[str, Any], operation: str, target_version: str) -> None:
     if result.get("success") is not True:
         raise ModelExpressUpdateError(
             f"ModelExpress {operation} failed for {target_version}: {result.get('detail', '')}"
@@ -48,7 +48,6 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         args: Namespace,
         model: Sequence[torch.nn.Module],
         weights_getter: Callable[[], Mapping[str, torch.Tensor]],
-        *,
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
         publisher=None,
