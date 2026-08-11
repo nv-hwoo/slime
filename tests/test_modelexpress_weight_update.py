@@ -85,7 +85,10 @@ class FakeEngine:
 
     def _prepare(self, target):
         self._event(f"prepare:{target}")
-        return {"success": True}
+        return {
+            "success": True,
+            "metrics": {"perf/mx_receive_prepare_time": 2.0},
+        }
 
     def _pause(self):
         self._event("pause")
@@ -102,6 +105,7 @@ class FakeEngine:
             "success": self.install_success,
             "installed_version": self.version,
             "detail": "install failed" if not self.install_success else "",
+            "metrics": {"perf/mx_receive_install_time": 3.0},
         }
 
     def _status(self):
@@ -129,6 +133,11 @@ def patch_runtime(monkeypatch):
     monkeypatch.setattr(mx_module.ray, "get", lambda refs: refs)
     monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(mx_module.dist, "barrier", lambda group=None: None)
+    monkeypatch.setattr(
+        mx_module.dist,
+        "broadcast_object_list",
+        lambda values, src, group=None: None,
+    )
     monkeypatch.setattr(mx_module.mpu, "get_data_parallel_rank", lambda **kwargs: 0)
     monkeypatch.setattr(mx_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(mx_module, "get_gloo_group", lambda: object())
@@ -147,6 +156,15 @@ def updater(publisher, *, stub_gather=True):
     if stub_gather:
         instance._for_each_hf_bucket = lambda consume: None
     return instance
+
+
+def test_receive_metrics_merge_by_max_latency():
+    assert mx_module._receiver_metrics(
+        [
+            {"metrics": {"perf/mx_receive_prepare_time": 2.0}},
+            {"metrics": {"perf/mx_receive_prepare_time": 3.0}},
+        ]
+    ) == {"perf/mx_receive_prepare_time": 3.0}
 
 
 def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
@@ -178,6 +196,8 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
         "perf/update_weights_wire_bytes": 123.0,
         "perf/mx_encode_delta": 4.0,
         "perf/mx_publish_time": 5.0,
+        "perf/mx_receive_prepare_time": 2.0,
+        "perf/mx_receive_install_time": 3.0,
     }
     assert instance.weight_version == 1
 
@@ -209,6 +229,24 @@ def test_failed_install_is_not_committed_or_resumed():
     assert publisher.catalog.commits == [("policy", "0")]
     assert not any(event == "continue" for event, _thread in events)
     assert instance.weight_version == 0
+
+
+def test_receive_metrics_are_broadcast_to_the_logging_rank(monkeypatch):
+    instance = updater(FakePublisher())
+    instance.connect_rollout_engines([FakeEngine([])], object())
+    instance.update_weights()
+    monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
+
+    def broadcast(values, src, group=None):
+        values[0] = {"perf/mx_receive_prepare_time": 7.0}
+
+    monkeypatch.setattr(mx_module.dist, "broadcast_object_list", broadcast)
+
+    instance.update_weights()
+    assert instance._control is not None
+    instance._control.shutdown()
+
+    assert instance.pop_metrics()["perf/mx_receive_prepare_time"] == 7.0
 
 
 def test_slime_hf_iterators_feed_the_publisher_in_native_order(monkeypatch):

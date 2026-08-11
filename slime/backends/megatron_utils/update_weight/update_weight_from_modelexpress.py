@@ -3,7 +3,7 @@ from __future__ import annotations
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, cast
 
 import ray
 import torch
@@ -30,6 +30,14 @@ def _require_success(result: Mapping[str, Any], *, operation: str, target_versio
 
 def _non_null(results: Sequence[Any]) -> list[Mapping[str, Any]]:
     return [result for result in results if result is not None]
+
+
+def _receiver_metrics(results: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for result in results:
+        for key, value in result.get("metrics", {}).items():
+            metrics[key] = max(metrics.get(key, 0.0), float(value))
+    return metrics
 
 
 class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
@@ -152,11 +160,13 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         if dist.get_rank() == 0:
             future = self._control.submit(self._activate_on_rank_zero, target_version)
         self._publisher.wait_for_commit(target_version, future)
-        if future is not None:
-            future.result()
-        dist.barrier(group=get_gloo_group())
+        gloo_group = cast(dist.ProcessGroup, get_gloo_group())
+        metrics_payload = [future.result() if future is not None else None]
+        dist.broadcast_object_list(metrics_payload, src=0, group=gloo_group)
+        receiver_metrics = metrics_payload[0] or {}
+        dist.barrier(group=gloo_group)
         self.weight_version += 1
-        self._metrics = self._publisher.pop_metrics()
+        self._metrics = {**self._publisher.pop_metrics(), **receiver_metrics}
 
     def _for_each_hf_bucket(self, consume) -> None:
         for chunk_iter in (
@@ -167,7 +177,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
                 consume(bucket)
             dist.barrier(group=get_gloo_group())
 
-    def _activate_on_rank_zero(self, target_version: str) -> None:
+    def _activate_on_rank_zero(self, target_version: str) -> dict[str, float]:
         engines = tuple(self.rollout_engines or ())
         if not engines:
             raise ModelExpressUpdateError("ModelExpress requires rollout engines")
@@ -201,3 +211,4 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
                 raise ModelExpressUpdateError("receiver status is not VERIFIED")
         self._catalog.commit_revision(self.args.modelexpress_model_id, target_version)
         ray.get([engine.continue_generation.remote() for engine in engines])
+        return _receiver_metrics([*prepared, *installed])
