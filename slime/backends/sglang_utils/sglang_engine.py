@@ -6,15 +6,23 @@ import os
 import time
 
 import requests
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
+from slime.backends.rollout_backend import MemoryTag
 from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+_SGLANG_MEMORY_TAGS = {
+    MemoryTag.WEIGHTS: GPU_MEMORY_TYPE_WEIGHTS,
+    MemoryTag.KV_CACHE: GPU_MEMORY_TYPE_KV_CACHE,
+    MemoryTag.CUDA_GRAPH: GPU_MEMORY_TYPE_CUDA_GRAPH,
+}
 
 
 def get_base_gpu_id(args, rank):
@@ -365,13 +373,11 @@ class SGLangEngine(RayActor):
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
-    def resume_memory_occupation(self, tags: list[str] = None):
-        """
-        Available tags for multi-stage resume: weights, kv_cache
-        """
+    def resume_memory_occupation(self, tags: list[MemoryTag] | None = None):
+        """Resume the tagged regions, or every region when *tags* is None."""
         return self._make_request(
             "resume_memory_occupation",
-            {"tags": tags},
+            {"tags": None if tags is None else [_SGLANG_MEMORY_TAGS[MemoryTag(tag)] for tag in tags]},
         )
 
     def check_weights(self, action: str):

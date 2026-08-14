@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from slime.backends.rollout_backend import MemoryTag
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,7 +174,7 @@ class ExternalRolloutServer:
     def offload(self):
         return []
 
-    def onload(self, tags: list[str] | None = None):
+    def onload(self, tags: list[MemoryTag] | None = None):
         return []
 
     def onload_weights(self):
