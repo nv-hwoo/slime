@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from slime.backends.rollout_backend import RolloutBackend
 from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args
@@ -41,6 +42,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--actor-num-gpus-per-node", type=int, default=8, help="Number of gpus per node for training actor"
             )
 
+            parser.add_argument(
+                "--rollout-backend",
+                type=RolloutBackend,
+                choices=list(RolloutBackend),
+                default=RolloutBackend.SGLANG,
+                help="Inference engine serving the rollout.",
+            )
             parser.add_argument(
                 "--rollout-num-gpus",
                 type=int,

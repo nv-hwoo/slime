@@ -12,11 +12,10 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from slime.backends.rollout_backend import MemoryTag, get_rollout_engine_cls
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.rollout.sample_hooks import set_current_rollout_id
 from slime.utils import logging_utils
@@ -216,7 +215,7 @@ class ServerGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        RolloutRayActor = ray.remote(get_rollout_engine_cls(self.args.rollout_backend))
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -306,7 +305,7 @@ class ServerGroup:
             return []
         return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
 
-    def onload(self, tags: list[str] | None = None):
+    def onload(self, tags: list[MemoryTag] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.  Skipped for groups that do not
@@ -418,10 +417,7 @@ class RolloutServer:
                 all_resume_engines.extend(engines)
             if all_resume_engines:
                 ray.get(
-                    [
-                        engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-                        for engine in all_resume_engines
-                    ]
+                    [engine.resume_memory_occupation.remote(tags=[MemoryTag.WEIGHTS]) for engine in all_resume_engines]
                 )
 
     def offload(self):
@@ -431,7 +427,7 @@ class RolloutServer:
             handles.extend(g.offload())
         return ray.get(handles) if handles else []
 
-    def onload(self, tags: list[str] | None = None):
+    def onload(self, tags: list[MemoryTag] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
         handles = []
         for g in self.server_groups:
@@ -450,14 +446,14 @@ class RolloutServer:
         for g in self.server_groups:
             if not g.needs_offload:
                 continue
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+            handles.extend(g.onload(tags=[MemoryTag.WEIGHTS]))
         return ray.get(handles) if handles else []
 
     def onload_kv(self):
         """Resume KV cache and CUDA graphs for offloaded groups."""
         handles = []
         for g in self.server_groups:
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
+            handles.extend(g.onload(tags=[MemoryTag.KV_CACHE, MemoryTag.CUDA_GRAPH]))
         return ray.get(handles) if handles else []
 
 
@@ -626,7 +622,7 @@ class RolloutManager:
         for srv in self.servers.values():
             srv.offload()
 
-    def onload(self, tags: list[str] | None = None):
+    def onload(self, tags: list[MemoryTag] | None = None):
         for srv in self.servers.values():
             srv.onload(tags)
 
