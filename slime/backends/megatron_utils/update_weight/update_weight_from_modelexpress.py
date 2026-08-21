@@ -3,7 +3,7 @@ from __future__ import annotations
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, cast
+from typing import Any
 
 import ray
 import torch
@@ -11,7 +11,6 @@ import torch.distributed as dist
 from megatron.core import mpu
 from ray.actor import ActorHandle
 
-from slime.utils.disk_delta import make_tensor_reader
 from slime.utils.distributed_utils import get_gloo_group
 
 from .update_weight_from_disk_delta import UpdateWeightFromDiskDelta
@@ -41,7 +40,7 @@ def _receiver_metrics(results: Sequence[Mapping[str, Any]]) -> dict[str, float]:
 
 
 class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
-    """Slime gather/control integration for the ModelExpress publisher."""
+    """Slime gather/control integration for ModelExpress S3/XOR refit."""
 
     def __init__(
         self,
@@ -50,7 +49,8 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         weights_getter: Callable[[], Mapping[str, torch.Tensor]],
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
-        publisher=None,
+        control_client=None,
+        trainer_client=None,
     ) -> None:
         del weights_getter
         self.args = args
@@ -60,35 +60,56 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         self.weight_version = int(args.modelexpress_initial_version)
         self.rollout_engines: Sequence[ActorHandle] | None = None
         self._connection_stale = False
-        self._baseline_captured = False
+        self._skip_startup_update = True
+        self._base_version_id = args.modelexpress_base_version_id
+        self._pending_version = None
+        self._pending_applied = False
+        self._pending_receiver_metrics = {}
+        self._installed_version = None
 
-        if publisher is None:
-            from modelexpress.refit import Publisher, PublisherConfig, S3Config
-
-            publisher = Publisher(
-                launch_checkpoint=args.hf_checkpoint,
-                bucket_bytes=args.update_weight_buffer_size,
-                group=get_gloo_group(),
+        if control_client is None or trainer_client is None:
+            from modelexpress_rl import (
+                ModelExpressControlClient,
+                ModelExpressTrainerClient,
+                ModelExpressTrainerConfig,
+                S3Config,
+                TrainerStagingMode,
+                WeightPayloadFormat,
             )
-            publisher.initialize(
-                PublisherConfig(
-                    model_id=args.modelexpress_model_id,
-                    catalog_endpoint=args.modelexpress_catalog_endpoint,
+
+            if control_client is None:
+                control_client = ModelExpressControlClient.connect(server_url=args.modelexpress_server_url)
+
+        self._control_client = control_client
+        base = self._control_client.get_weight_version(self._base_version_id)
+        if base.model_name != args.modelexpress_model_id:
+            raise ModelExpressUpdateError("ModelExpress base version belongs to a different model")
+        if getattr(base.state, "value", base.state) != "READY":
+            raise ModelExpressUpdateError("ModelExpress base version is not READY")
+        if trainer_client is None:
+            trainer_client = ModelExpressTrainerClient.initialize(
+                ModelExpressTrainerConfig(
+                    model_name=args.modelexpress_model_id,
+                    server_url=args.modelexpress_server_url,
+                    staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
+                    payload_format=WeightPayloadFormat.XOR_DELTA,
+                    process_group=get_gloo_group(),
                     s3=S3Config(
                         bucket=args.modelexpress_s3_bucket,
                         prefix=args.modelexpress_s3_prefix,
                         endpoint_url=args.modelexpress_s3_endpoint,
+                        initial_base_version_id=self._base_version_id,
+                        launch_checkpoint=args.hf_checkpoint,
                     ),
                 )
             )
-        self._publisher = publisher
-        self._catalog = publisher.catalog
-        self._control = (
+        self._trainer_client = trainer_client
+
+        self._activation_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="modelexpress-control")
             if dist.get_rank() == 0
             else None
         )
-        self._publisher.publish_version("0")
 
     def is_rollout_engines_fresh(self) -> bool:
         return self.rollout_engines is not None and not self._connection_stale
@@ -110,23 +131,24 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         self._is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         )
-        version = str(self.weight_version)
-        launch_pending = self._publisher.pending_version == version
+        expected_version = self._base_version_id
+        validation = [None]
         if dist.get_rank() == 0:
-            statuses = _non_null(ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines]))
-            if len(statuses) != len(self.rollout_engines):
-                raise ModelExpressUpdateError("rollout launch cohort is incomplete")
-            for status in statuses:
-                if (
-                    status.get("installed_version") != version
-                    or status.get("target_digest") != self._publisher.target_digest
-                    or status.get("state") != "VERIFIED"
-                ):
-                    raise ModelExpressUpdateError("rollout cohort does not match the current revision")
-            if launch_pending:
-                self._catalog.commit_revision(self.args.modelexpress_model_id, version)
-        if launch_pending:
-            self._publisher.wait_for_commit(version)
+            try:
+                statuses = _non_null(
+                    ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines])
+                )
+                if len(statuses) != len(self.rollout_engines):
+                    raise ModelExpressUpdateError("rollout launch cohort is incomplete")
+                for status in statuses:
+                    if status.get("installed_version") != expected_version or status.get("state") != "VERIFIED":
+                        raise ModelExpressUpdateError("rollout cohort does not match the current revision")
+                validation[0] = {"success": True}
+            except Exception as error:
+                validation[0] = {"error": f"{type(error).__name__}: {error}"}
+        dist.broadcast_object_list(validation, src=0, group=get_gloo_group())
+        if "error" in validation[0]:
+            raise ModelExpressUpdateError(validation[0]["error"])
 
     def disconnect_rollout_engines(self) -> None:
         self.rollout_engines = None
@@ -139,33 +161,106 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
 
     @torch.no_grad()
     def update_weights(self) -> None:
-        if not self._baseline_captured:
-            self._publisher.capture_baseline(
-                self._for_each_hf_bucket,
-                make_tensor_reader(self.args.hf_checkpoint),
-            )
-            self._baseline_captured = True
+        # Slime invokes the updater once at startup. The explicit READY base
+        # already represents those launch weights, so there is nothing to publish.
+        if self._skip_startup_update:
+            self._skip_startup_update = False
             return
         if self.rollout_engines is None:
             raise ModelExpressUpdateError("rollout engines are not connected")
 
-        target_version = str(self.weight_version + 1)
-        self._publisher.publish_version(
-            target_version,
-            base_version=str(self.weight_version),
-            gather_hf_buckets=self._for_each_hf_bucket,
-        )
-        future = None
-        if dist.get_rank() == 0:
-            future = self._control.submit(self._activate_on_rank_zero, target_version)
-        self._publisher.wait_for_commit(target_version, future)
-        gloo_group = cast(dist.ProcessGroup, get_gloo_group())
-        metrics_payload = [future.result() if future is not None else None]
-        dist.broadcast_object_list(metrics_payload, src=0, group=gloo_group)
-        receiver_metrics = metrics_payload[0] or {}
+        if self._pending_version is None:
+            from modelexpress_rl import WeightPayloadFormat
+
+            payload = [None]
+            if dist.get_rank() == 0:
+                try:
+                    payload[0] = {
+                        "version": self._control_client.create_weight_version(
+                            model_name=self.args.modelexpress_model_id,
+                            idempotency_key=(
+                                f"slime:{self.args.modelexpress_model_id}:"
+                                f"{self._base_version_id}:{self.weight_version + 1}"
+                            ),
+                            version_number=self.weight_version + 1,
+                            payload_format=WeightPayloadFormat.XOR_DELTA,
+                            base_version_id=self._base_version_id,
+                            expected_source_slots=["canonical.delta.root"],
+                        )
+                    }
+                except Exception as error:
+                    payload[0] = {"error": f"{type(error).__name__}: {error}"}
+            dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
+            if "error" in payload[0]:
+                raise ModelExpressUpdateError(f"ModelExpress create failed: {payload[0]['error']}")
+            target = payload[0]["version"]
+            staged = self._trainer_client.stage_shard(
+                version=target.ref,
+                tensors=self._for_each_hf_bucket,
+            )
+            staged.publish()
+            self._pending_version = target
+
+        if getattr(self._pending_version.state, "value", self._pending_version.state) != "READY":
+            ready_payload = [None]
+            if dist.get_rank() == 0:
+                try:
+                    ready = self._control_client.get_weight_version(self._pending_version.version_id)
+                    if getattr(ready.state, "value", ready.state) != "READY":
+                        raise ModelExpressUpdateError("published ModelExpress target is not READY")
+                    ready_payload[0] = {"version": ready}
+                except Exception as error:
+                    ready_payload[0] = {"error": f"{type(error).__name__}: {error}"}
+            dist.broadcast_object_list(ready_payload, src=0, group=get_gloo_group())
+            if "error" in ready_payload[0]:
+                raise ModelExpressUpdateError(ready_payload[0]["error"])
+            self._pending_version = ready_payload[0]["version"]
+
+        gloo_group = get_gloo_group()
+        target_version = self._pending_version.version_id
+        if not self._pending_applied:
+            future = None
+            if dist.get_rank() == 0:
+                future = self._activation_executor.submit(self._activate_on_rank_zero, target_version)
+            activation = [None]
+            if future is not None:
+                try:
+                    activation[0] = {"metrics": future.result()}
+                except Exception as error:
+                    activation[0] = {"error": f"{type(error).__name__}: {error}"}
+            dist.broadcast_object_list(activation, src=0, group=gloo_group)
+            if "error" in activation[0]:
+                raise ModelExpressUpdateError(activation[0]["error"])
+            self._pending_receiver_metrics = activation[0]["metrics"]
+            self._pending_applied = True
+
+        previous = self._installed_version
+        if previous is not None:
+            retirement = [None]
+            if dist.get_rank() == 0:
+                try:
+                    self._control_client.delete_weight_version(previous.version_id)
+                    retirement[0] = {"success": True}
+                except Exception as error:
+                    retirement[0] = {"error": f"{type(error).__name__}: {error}"}
+            dist.broadcast_object_list(retirement, src=0, group=gloo_group)
+            if "error" in retirement[0]:
+                raise ModelExpressUpdateError(
+                    f"ModelExpress retirement failed: {retirement[0]['error']}"
+                )
+            self._trainer_client.release_version(version=previous.ref)
+
         dist.barrier(group=gloo_group)
+        self._base_version_id = target_version
+        self._installed_version = self._pending_version
+        self._pending_version = None
+        self._pending_applied = False
         self.weight_version += 1
-        self._metrics = {**self._publisher.pop_metrics(), **receiver_metrics}
+        self._metrics = {
+            **self._trainer_client.pop_metrics(),
+            **self._pending_receiver_metrics,
+        }
+        self._pending_receiver_metrics = {}
 
     def _for_each_hf_bucket(self, consume) -> None:
         for chunk_iter in (
@@ -204,10 +299,8 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         for status in statuses:
             if (
                 status.get("installed_version") != target_version
-                or status.get("target_digest") != self._publisher.pending_digest
                 or status.get("state") != "VERIFIED"
             ):
                 raise ModelExpressUpdateError("receiver status is not VERIFIED")
-        self._catalog.commit_revision(self.args.modelexpress_model_id, target_version)
         ray.get([engine.continue_generation.remote() for engine in engines])
         return _receiver_metrics([*prepared, *installed])
