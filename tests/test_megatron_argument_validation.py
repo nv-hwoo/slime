@@ -258,6 +258,8 @@ def make_slime_validate_args(**overrides):
         update_weight_mode="full",
         custom_update_weight_post_write_path=None,
         modelexpress_model_id=None,
+        modelexpress_server_url=None,
+        modelexpress_base_version_id=None,
         modelexpress_catalog_endpoint=None,
         modelexpress_s3_bucket=None,
         modelexpress_preparation_cache_dir=None,
@@ -415,11 +417,28 @@ def test_modelexpress_requires_its_stable_configuration(monkeypatch):
 
 
 @pytest.mark.unit
+def test_modelexpress_requires_refit_server_and_ready_base(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        update_weight_backend="modelexpress",
+        modelexpress_model_id="policy",
+        modelexpress_catalog_endpoint="dns:///catalog:50051",
+        modelexpress_s3_bucket="weights",
+        modelexpress_preparation_cache_dir="/mxdelta/mxprep",
+    )
+
+    with pytest.raises(ValueError, match="modelexpress-server-url.*modelexpress-base-version-id"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
 def test_modelexpress_does_not_require_native_disk_configuration(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(
         update_weight_backend="modelexpress",
         modelexpress_model_id="policy",
+        modelexpress_server_url="dns:///modelexpress:8001",
+        modelexpress_base_version_id="launch-ready-uid",
         modelexpress_catalog_endpoint="dns:///catalog:50051",
         modelexpress_s3_bucket="weights",
         modelexpress_preparation_cache_dir="/mxdelta/mxprep",

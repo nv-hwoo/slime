@@ -135,6 +135,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Select the native updater or the ModelExpress canonical S3 lifecycle.",
             )
             parser.add_argument("--modelexpress-model-id", type=str, default=None)
+            parser.add_argument("--modelexpress-server-url", type=str, default=None)
+            parser.add_argument("--modelexpress-base-version-id", type=str, default=None)
             parser.add_argument("--modelexpress-catalog-endpoint", type=str, default=None)
             parser.add_argument("--modelexpress-s3-endpoint", type=str, default=None)
             parser.add_argument("--modelexpress-s3-bucket", type=str, default=None)
@@ -2062,6 +2064,8 @@ def slime_validate_args(args):
     if args.update_weight_backend == "modelexpress":
         required = {
             "--modelexpress-model-id": args.modelexpress_model_id,
+            "--modelexpress-server-url": args.modelexpress_server_url,
+            "--modelexpress-base-version-id": args.modelexpress_base_version_id,
             "--modelexpress-catalog-endpoint": args.modelexpress_catalog_endpoint,
             "--modelexpress-s3-bucket": args.modelexpress_s3_bucket,
             "--modelexpress-preparation-cache-dir": args.modelexpress_preparation_cache_dir,
