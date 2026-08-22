@@ -139,13 +139,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--modelexpress-model-id", type=str, default=None)
             parser.add_argument("--modelexpress-server-url", type=str, default=None)
             parser.add_argument("--modelexpress-base-version-id", type=str, default=None)
-            parser.add_argument("--modelexpress-catalog-endpoint", type=str, default=None)
             parser.add_argument("--modelexpress-s3-endpoint", type=str, default=None)
             parser.add_argument("--modelexpress-s3-bucket", type=str, default=None)
             parser.add_argument("--modelexpress-s3-prefix", type=str, default="")
             parser.add_argument("--modelexpress-preparation-cache-dir", type=str, default=None)
             parser.add_argument("--modelexpress-initial-version", type=str, default="0")
-            parser.add_argument("--modelexpress-ready-timeout-seconds", type=float, default=600.0)
             parser.add_argument(
                 "--update-weight-mode",
                 choices=["full", "delta"],
@@ -2064,7 +2062,6 @@ def slime_validate_args(args):
             "--modelexpress-model-id": args.modelexpress_model_id,
             "--modelexpress-server-url": args.modelexpress_server_url,
             "--modelexpress-base-version-id": args.modelexpress_base_version_id,
-            "--modelexpress-catalog-endpoint": args.modelexpress_catalog_endpoint,
             "--modelexpress-s3-bucket": args.modelexpress_s3_bucket,
             "--modelexpress-preparation-cache-dir": args.modelexpress_preparation_cache_dir,
         }
@@ -2079,8 +2076,6 @@ def slime_validate_args(args):
             raise ValueError("ModelExpress does not support LoRA weight updates")
         if args.modelexpress_initial_version != "0":
             raise ValueError("ModelExpress requires --modelexpress-initial-version=0")
-        if args.modelexpress_ready_timeout_seconds <= 0:
-            raise ValueError("--modelexpress-ready-timeout-seconds must be positive")
         if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:
             raise ValueError("ModelExpress does not use native disk weight-update directories")
         if args.custom_update_weight_post_write_path:

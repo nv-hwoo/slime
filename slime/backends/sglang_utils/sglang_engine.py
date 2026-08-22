@@ -595,22 +595,20 @@ def _compute_server_args(
     server_arg_field_names = {attr.name for attr in server_arg_fields}
     if getattr(args, "update_weight_backend", "native") == "modelexpress":
         required_fields = {
-            "modelexpress_model_id",
-            "modelexpress_catalog_endpoint",
-            "modelexpress_delta_s3_endpoint",
-            "modelexpress_initial_version",
-            "modelexpress_ready_timeout_seconds",
+            "modelexpress_model_name",
+            "modelexpress_server_url",
+            "modelexpress_s3_endpoint_url",
+            "modelexpress_initial_base_version_id",
             "modelexpress_preparation_cache_dir",
         }
         missing_fields = required_fields - server_arg_field_names
         if missing_fields:
             raise RuntimeError("SGLang lacks ModelExpress support: " + ", ".join(sorted(missing_fields)))
         kwargs.update(
-            modelexpress_model_id=args.modelexpress_model_id,
-            modelexpress_catalog_endpoint=args.modelexpress_catalog_endpoint,
-            modelexpress_delta_s3_endpoint=args.modelexpress_s3_endpoint,
-            modelexpress_initial_version=args.modelexpress_initial_version,
-            modelexpress_ready_timeout_seconds=args.modelexpress_ready_timeout_seconds,
+            modelexpress_model_name=args.modelexpress_model_id,
+            modelexpress_server_url=args.modelexpress_server_url,
+            modelexpress_s3_endpoint_url=args.modelexpress_s3_endpoint,
+            modelexpress_initial_base_version_id=args.modelexpress_base_version_id,
             modelexpress_preparation_cache_dir=args.modelexpress_preparation_cache_dir,
         )
     unused_keys = set(kwargs.keys())
