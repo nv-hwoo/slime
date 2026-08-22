@@ -58,7 +58,7 @@ def test_modelexpress_private_startup_config_reaches_sglang(monkeypatch):
         update_weight_backend="modelexpress",
         use_rollout_routing_replay=False,
     )
-    monkeypatch.setattr(sglang_engine, "_to_local_gpu_id", lambda value: value)
+    monkeypatch.setattr(sglang_engine.accelerator, "resolve_visible_device_id", lambda value: value)
 
     server_args, _ = sglang_engine._compute_server_args(
         args,
