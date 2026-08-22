@@ -40,11 +40,11 @@ def test_modelexpress_private_startup_config_reaches_sglang(monkeypatch):
         debug_rollout_only=False,
         fp16=False,
         hf_checkpoint="/models/model",
-        modelexpress_catalog_endpoint="dns:///catalog:50051",
+        modelexpress_base_version_id="base-a",
         modelexpress_initial_version="0",
         modelexpress_model_id="policy",
         modelexpress_preparation_cache_dir="/models/mx-cache",
-        modelexpress_ready_timeout_seconds=321.0,
+        modelexpress_server_url="dns:///modelexpress:8001",
         modelexpress_s3_bucket="weights",
         modelexpress_s3_endpoint=None,
         modelexpress_s3_prefix="run/policy",
@@ -69,10 +69,9 @@ def test_modelexpress_private_startup_config_reaches_sglang(monkeypatch):
         port=30000,
     )
 
-    assert server_args["modelexpress_model_id"] == "policy"
-    assert server_args["modelexpress_catalog_endpoint"] == "dns:///catalog:50051"
+    assert server_args["modelexpress_model_name"] == "policy"
+    assert server_args["modelexpress_server_url"] == "dns:///modelexpress:8001"
     assert "modelexpress_delta_s3_bucket" not in server_args
     assert "modelexpress_delta_s3_prefix" not in server_args
-    assert server_args["modelexpress_initial_version"] == "0"
-    assert server_args["modelexpress_ready_timeout_seconds"] == 321.0
+    assert server_args["modelexpress_initial_base_version_id"] == "base-a"
     assert server_args["modelexpress_preparation_cache_dir"] == "/models/mx-cache"
