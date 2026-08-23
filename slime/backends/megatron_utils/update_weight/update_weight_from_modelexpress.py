@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -13,7 +13,9 @@ from ray.actor import ActorHandle
 
 from slime.utils.distributed_utils import get_gloo_group
 
-from .update_weight_from_disk_delta import UpdateWeightFromDiskDelta
+from ..megatron_to_hf import convert_to_hf
+from .common import all_gather_param, named_params_and_buffers
+from .update_weight_from_distributed import UpdateWeightFromDistributed
 
 
 class ModelExpressUpdateError(RuntimeError):
@@ -39,7 +41,7 @@ def _receiver_metrics(results: Sequence[Mapping[str, Any]]) -> dict[str, float]:
     return metrics
 
 
-class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
+class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
     """Slime gather/control integration for ModelExpress S3/XOR refit."""
 
     def __init__(
@@ -196,7 +198,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
             target = payload[0]["version"]
             staged = self._trainer_client.stage_shard(
                 version=target.ref,
-                tensors=self._for_each_hf_bucket,
+                hf_tensor_iter=self._iter_hf_tensors(),
             )
             staged.publish()
             self._pending_version = target
@@ -245,9 +247,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
                     retirement[0] = {"error": f"{type(error).__name__}: {error}"}
             dist.broadcast_object_list(retirement, src=0, group=gloo_group)
             if "error" in retirement[0]:
-                raise ModelExpressUpdateError(
-                    f"ModelExpress retirement failed: {retirement[0]['error']}"
-                )
+                raise ModelExpressUpdateError(f"ModelExpress retirement failed: {retirement[0]['error']}")
             self._trainer_client.release_version(version=previous.ref)
 
         dist.barrier(group=gloo_group)
@@ -256,20 +256,41 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         self._pending_version = None
         self._pending_applied = False
         self.weight_version += 1
+        self._trainer_client.collect_metrics()
         self._metrics = {
             **self._trainer_client.pop_metrics(),
             **self._pending_receiver_metrics,
         }
         self._pending_receiver_metrics = {}
 
-    def _for_each_hf_bucket(self, consume) -> None:
-        for chunk_iter in (
-            self._iter_non_expert_chunks(),
-            self._iter_expert_chunks(),
+    def _iter_hf_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for tensor_iter in (
+            self._iter_non_expert_tensors(),
+            self._iter_expert_tensors(),
         ):
-            for bucket in chunk_iter:
-                consume(bucket)
+            yield from tensor_iter
             dist.barrier(group=get_gloo_group())
+
+    def _iter_non_expert_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for name, param in named_params_and_buffers(self.args, self.model):
+            if ".experts." in name:
+                continue
+            param = all_gather_param(name, param)
+            if self._is_pp_src_rank:
+                yield from convert_to_hf(
+                    self.args,
+                    self.model_name,
+                    name,
+                    param,
+                    self.quantization_config,
+                )
+
+    def _iter_expert_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for name, param in named_params_and_buffers(self.args, self.model):
+            if ".experts." not in name:
+                continue
+            param = all_gather_param(name, param)
+            yield from self._ep_gather_and_convert([(name, param)])
 
     def _activate_on_rank_zero(self, target_version: str) -> dict[str, float]:
         engines = tuple(self.rollout_engines or ())
@@ -297,10 +318,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         if len(statuses) != len(engines):
             raise ModelExpressUpdateError("rollout verification cohort is incomplete")
         for status in statuses:
-            if (
-                status.get("installed_version") != target_version
-                or status.get("state") != "VERIFIED"
-            ):
+            if status.get("installed_version") != target_version or status.get("state") != "VERIFIED":
                 raise ModelExpressUpdateError("receiver status is not VERIFIED")
         ray.get([engine.continue_generation.remote() for engine in engines])
         return _receiver_metrics([*prepared, *installed])

@@ -4,6 +4,7 @@ import types
 from argparse import Namespace
 
 import pytest
+import torch
 
 from slime.backends.megatron_utils.update_weight import update_weight_from_modelexpress as mx_module
 from slime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import (
@@ -69,18 +70,23 @@ class FakeTrainerClient:
         self.control = control
         self.stages = []
         self.releases = []
+        self.metric_collections = 0
         self.metrics = {
             "perf/update_weights_density": 0.25,
+            "perf/update_weights_wire_bytes": 123.0,
         }
 
-    def stage_shard(self, *, version, tensors):
+    def stage_shard(self, *, version, hf_tensor_iter):
         staged = FakeStagedShard(self.control, version.version_id)
-        self.stages.append((version, tensors, threading.current_thread().name, staged))
+        self.stages.append((version, hf_tensor_iter, threading.current_thread().name, staged))
         return staged
 
     def pop_metrics(self):
         metrics, self.metrics = self.metrics, {}
         return metrics
+
+    def collect_metrics(self):
+        self.metric_collections += 1
 
     def release_version(self, *, version):
         self.releases.append(version)
@@ -176,7 +182,7 @@ def updater(control=None, trainer=None, stub_gather=True):
         trainer_client=trainer,
     )
     if stub_gather:
-        instance._for_each_hf_bucket = lambda consume: None
+        instance._iter_hf_tensors = lambda: iter(())
     return instance, control, trainer
 
 
@@ -259,7 +265,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
         }
     ]
     assert trainer.stages[0][0].version_id == "target-1"
-    assert trainer.stages[0][1] is instance._for_each_hf_bucket
+    assert iter(trainer.stages[0][1]) is trainer.stages[0][1]
     assert trainer.stages[0][2] == main
     assert trainer.stages[0][3].publish_count == 1
     assert control.deletes == []
@@ -267,9 +273,11 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
     assert all(thread.startswith("modelexpress-control") for _event, thread in events)
     assert instance.pop_metrics() == {
         "perf/update_weights_density": 0.25,
+        "perf/update_weights_wire_bytes": 123.0,
         "perf/mx_receive_prepare_time": 2.0,
         "perf/mx_receive_install_time": 3.0,
     }
+    assert trainer.metric_collections == 1
     assert instance.weight_version == 1
 
 
@@ -430,13 +438,57 @@ def test_receive_metrics_are_broadcast_to_the_logging_rank(monkeypatch):
     assert instance.pop_metrics()["perf/mx_receive_prepare_time"] == 7.0
 
 
-def test_slime_hf_iterators_feed_the_stage_callback_in_native_order(monkeypatch):
+def test_slime_hf_tensor_stream_preserves_native_order(monkeypatch):
     instance, _control, _trainer = updater(stub_gather=False)
-    buckets = [[("a", object())], [("b", object())]]
-    monkeypatch.setattr(instance, "_iter_non_expert_chunks", lambda: iter(buckets[:1]))
-    monkeypatch.setattr(instance, "_iter_expert_chunks", lambda: iter(buckets[1:]))
-    consumed = []
+    tensors = [("a", object()), ("b", object())]
+    monkeypatch.setattr(instance, "_iter_non_expert_tensors", lambda: iter(tensors[:1]))
+    monkeypatch.setattr(instance, "_iter_expert_tensors", lambda: iter(tensors[1:]))
 
-    instance._for_each_hf_bucket(consumed.append)
+    assert list(instance._iter_hf_tensors()) == tensors
 
-    assert consumed == buckets
+
+def test_non_expert_hf_tensors_are_streamed_after_conversion(monkeypatch):
+    instance, _control, _trainer = updater(stub_gather=False)
+    instance._is_pp_src_rank = True
+    params = [
+        ("layer.a", torch.tensor([1.0])),
+        ("layer.b", torch.tensor([2.0])),
+    ]
+    converted = []
+    monkeypatch.setattr(mx_module, "named_params_and_buffers", lambda *_args: iter(params))
+    monkeypatch.setattr(mx_module, "all_gather_param", lambda _name, param: param)
+
+    def convert(_args, _model_name, name, param, _quantization_config):
+        converted.append(name)
+        return [(f"hf.{name}", param)]
+
+    monkeypatch.setattr(mx_module, "convert_to_hf", convert)
+    tensors = instance._iter_non_expert_tensors()
+
+    assert next(tensors) == ("hf.layer.a", params[0][1])
+    assert converted == ["layer.a"]
+    assert list(tensors) == [("hf.layer.b", params[1][1])]
+
+
+def test_expert_hf_tensors_are_streamed_after_conversion(monkeypatch):
+    instance, _control, _trainer = updater(stub_gather=False)
+    instance._is_pp_src_rank = True
+    batch = [
+        ("layer.experts.a", torch.tensor([1.0])),
+        ("layer.experts.b", torch.tensor([2.0])),
+    ]
+    gathered = []
+    monkeypatch.setattr(mx_module, "named_params_and_buffers", lambda *_args: iter(batch))
+    monkeypatch.setattr(mx_module, "all_gather_param", lambda _name, param: param)
+
+    def gather_and_convert(named_tensors):
+        name, param = named_tensors[0]
+        gathered.append(name)
+        return [(f"hf.{name}", param)]
+
+    monkeypatch.setattr(instance, "_ep_gather_and_convert", gather_and_convert)
+    tensors = instance._iter_expert_tensors()
+
+    assert next(tensors) == ("hf.layer.experts.a", batch[0][1])
+    assert gathered == ["layer.experts.a"]
+    assert list(tensors) == [("hf.layer.experts.b", batch[1][1])]
