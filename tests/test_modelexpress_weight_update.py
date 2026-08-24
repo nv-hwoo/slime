@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from slime.backends.megatron_utils.update_weight import update_weight_from_modelexpress as mx_module
+from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as distributed_module
 from slime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import (
     ModelExpressUpdateError,
     UpdateWeightFromModelExpress,
@@ -70,6 +71,7 @@ class FakeTrainerClient:
         self.control = control
         self.stages = []
         self.releases = []
+        self.base_preparations = []
         self.metric_collections = 0
         self.metrics = {
             "perf/update_weights_density": 0.25,
@@ -80,6 +82,9 @@ class FakeTrainerClient:
         staged = FakeStagedShard(self.control, version.version_id)
         self.stages.append((version, hf_tensor_iter, threading.current_thread().name, staged))
         return staged
+
+    def prepare_delta_base(self, *, hf_tensor_iter):
+        self.base_preparations.append(list(hf_tensor_iter))
 
     def pop_metrics(self):
         metrics, self.metrics = self.metrics, {}
@@ -145,6 +150,7 @@ class FakeEngine:
 def args():
     return Namespace(
         hf_checkpoint="/models/model",
+        update_weight_buffer_size=512 * 1024**2,
         modelexpress_initial_version="0",
         modelexpress_model_id="policy",
         modelexpress_base_version_id="base-uid",
@@ -182,8 +188,43 @@ def updater(control=None, trainer=None, stub_gather=True):
         trainer_client=trainer,
     )
     if stub_gather:
-        instance._iter_hf_tensors = lambda: iter(())
+        instance._iter_hf_buckets = lambda: iter(())
     return instance, control, trainer
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [(None, 123), ("1024", 1024)],
+)
+def test_model_express_bucket_size_prefers_explicit_env(
+    monkeypatch, override, expected
+):
+    config = args()
+    config.update_weight_buffer_size = 123
+    if override is None:
+        monkeypatch.delenv("MX_REFIT_DELTA_BUCKET_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", override)
+    control = FakeControlClient()
+    instance = UpdateWeightFromModelExpress(
+        config,
+        model=[],
+        weights_getter=lambda: {},
+        model_name="qwen3",
+        quantization_config=None,
+        control_client=control,
+        trainer_client=FakeTrainerClient(control),
+    )
+    instance._activation_executor.shutdown()
+
+    assert instance.args.update_weight_buffer_size == expected
+
+
+def test_model_express_bucket_size_rejects_nonpositive_env(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", "0")
+
+    with pytest.raises(ValueError, match="MX_REFIT_DELTA_BUCKET_BYTES must be positive"):
+        updater()
 
 
 def test_receive_metrics_merge_by_max_latency():
@@ -250,6 +291,13 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
     instance.connect_rollout_engines([FakeEngine(events)], object())
 
     instance.update_weights()
+    assert trainer.base_preparations == [[]]
+    assert instance._delta_base_prepared is True
+    assert control.creates == []
+    assert trainer.stages == []
+    assert events == []
+    assert instance.weight_version == 0
+
     instance.update_weights()
     instance._activation_executor.shutdown()
 
@@ -438,57 +486,65 @@ def test_receive_metrics_are_broadcast_to_the_logging_rank(monkeypatch):
     assert instance.pop_metrics()["perf/mx_receive_prepare_time"] == 7.0
 
 
-def test_slime_hf_tensor_stream_preserves_native_order(monkeypatch):
+def test_slime_hf_bucket_stream_preserves_framework_buckets(monkeypatch):
     instance, _control, _trainer = updater(stub_gather=False)
-    tensors = [("a", object()), ("b", object())]
-    monkeypatch.setattr(instance, "_iter_non_expert_tensors", lambda: iter(tensors[:1]))
-    monkeypatch.setattr(instance, "_iter_expert_tensors", lambda: iter(tensors[1:]))
+    buckets = [[("a", object())], [("b", object()), ("c", object())]]
+    events = []
 
-    assert list(instance._iter_hf_tensors()) == tensors
+    def non_experts():
+        yield buckets[0]
+        events.append("nonexperts-finished")
 
+    def experts():
+        events.append("experts-started")
+        yield buckets[1]
+        events.append("experts-finished")
 
-def test_non_expert_hf_tensors_are_streamed_after_conversion(monkeypatch):
-    instance, _control, _trainer = updater(stub_gather=False)
-    instance._is_pp_src_rank = True
-    params = [
-        ("layer.a", torch.tensor([1.0])),
-        ("layer.b", torch.tensor([2.0])),
+    monkeypatch.setattr(instance, "_iter_non_expert_chunks", non_experts)
+    monkeypatch.setattr(instance, "_iter_expert_chunks", experts)
+    monkeypatch.setattr(mx_module.dist, "barrier", lambda group=None: events.append("barrier"))
+
+    assert list(instance._iter_hf_buckets()) == buckets
+    assert events == [
+        "nonexperts-finished",
+        "barrier",
+        "experts-started",
+        "experts-finished",
+        "barrier",
     ]
-    converted = []
-    monkeypatch.setattr(mx_module, "named_params_and_buffers", lambda *_args: iter(params))
-    monkeypatch.setattr(mx_module, "all_gather_param", lambda _name, param: param)
-
-    def convert(_args, _model_name, name, param, _quantization_config):
-        converted.append(name)
-        return [(f"hf.{name}", param)]
-
-    monkeypatch.setattr(mx_module, "convert_to_hf", convert)
-    tensors = instance._iter_non_expert_tensors()
-
-    assert next(tensors) == ("hf.layer.a", params[0][1])
-    assert converted == ["layer.a"]
-    assert list(tensors) == [("hf.layer.b", params[1][1])]
 
 
-def test_expert_hf_tensors_are_streamed_after_conversion(monkeypatch):
+def test_model_express_retains_expert_ep_gather_batching(monkeypatch):
     instance, _control, _trainer = updater(stub_gather=False)
-    instance._is_pp_src_rank = True
-    batch = [
+    instance.args.update_weight_buffer_size = 1024
+    experts = [
         ("layer.experts.a", torch.tensor([1.0])),
         ("layer.experts.b", torch.tensor([2.0])),
     ]
     gathered = []
-    monkeypatch.setattr(mx_module, "named_params_and_buffers", lambda *_args: iter(batch))
-    monkeypatch.setattr(mx_module, "all_gather_param", lambda _name, param: param)
+    monkeypatch.setattr(
+        distributed_module,
+        "named_params_and_buffers",
+        lambda *_args: iter(experts),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "all_gather_param",
+        lambda _name, param: param,
+    )
+    monkeypatch.setattr(
+        distributed_module.mpu,
+        "get_expert_model_parallel_world_size",
+        lambda: 1,
+    )
 
-    def gather_and_convert(named_tensors):
-        name, param = named_tensors[0]
-        gathered.append(name)
-        return [(f"hf.{name}", param)]
+    def gather_and_convert(batch):
+        gathered.append(tuple(name for name, _param in batch))
+        return [(f"hf.{name}", param) for name, param in batch]
 
     monkeypatch.setattr(instance, "_ep_gather_and_convert", gather_and_convert)
-    tensors = instance._iter_expert_tensors()
 
-    assert next(tensors) == ("hf.layer.experts.a", batch[0][1])
-    assert gathered == ["layer.experts.a"]
-    assert list(tensors) == [("hf.layer.experts.b", batch[1][1])]
+    assert list(instance._iter_expert_chunks()) == [
+        [(f"hf.{name}", param) for name, param in experts]
+    ]
+    assert gathered == [("layer.experts.a", "layer.experts.b")]
