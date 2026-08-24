@@ -4,6 +4,7 @@ import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from time import perf_counter
 from typing import Any
 
 import ray
@@ -40,6 +41,16 @@ def _receiver_metrics(results: Sequence[Mapping[str, Any]]) -> dict[str, float]:
     return metrics
 
 
+_UPDATE_PHASE_METRICS = (
+    "perf/mx_control_create_weight_version",
+    "perf/mx_stage_shard",
+    "perf/mx_publish_shard",
+    "perf/mx_control_get_weight_version_ready",
+    "perf/mx_update_activate_time",
+    "perf/mx_update_finalize_time",
+)
+
+
 class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
     """Slime gather/control integration for ModelExpress S3/XOR refit."""
 
@@ -68,10 +79,6 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         self._connection_stale = False
         self._delta_base_prepared = False
         self._base_version_id = args.modelexpress_base_version_id
-        self._pending_version = None
-        self._pending_applied = False
-        self._pending_receiver_metrics = {}
-        self._installed_version = None
 
         if control_client is None or trainer_client is None:
             from modelexpress_rl import (
@@ -138,23 +145,16 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         )
         expected_version = self._base_version_id
-        validation = [None]
         if dist.get_rank() == 0:
-            try:
-                statuses = _non_null(
-                    ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines])
-                )
-                if len(statuses) != len(self.rollout_engines):
-                    raise ModelExpressUpdateError("rollout launch cohort is incomplete")
-                for status in statuses:
-                    if status.get("installed_version") != expected_version or status.get("state") != "VERIFIED":
-                        raise ModelExpressUpdateError("rollout cohort does not match the current revision")
-                validation[0] = {"success": True}
-            except Exception as error:
-                validation[0] = {"error": f"{type(error).__name__}: {error}"}
-        dist.broadcast_object_list(validation, src=0, group=get_gloo_group())
-        if "error" in validation[0]:
-            raise ModelExpressUpdateError(validation[0]["error"])
+            statuses = _non_null(
+                ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines])
+            )
+            if len(statuses) != len(self.rollout_engines):
+                raise ModelExpressUpdateError("rollout launch cohort is incomplete")
+            for status in statuses:
+                if status.get("installed_version") != expected_version or status.get("state") != "VERIFIED":
+                    raise ModelExpressUpdateError("rollout cohort does not match the current revision")
+        dist.barrier(group=get_gloo_group())
 
     def disconnect_rollout_engines(self) -> None:
         self.rollout_engines = None
@@ -177,97 +177,119 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         if self.rollout_engines is None:
             raise ModelExpressUpdateError("rollout engines are not connected")
 
-        if self._pending_version is None:
-            from modelexpress_rl import WeightPayloadFormat
+        phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
 
-            payload = [None]
-            if dist.get_rank() == 0:
-                try:
-                    payload[0] = {
-                        "version": self._control_client.create_weight_version(
-                            model_name=self.args.modelexpress_model_id,
-                            idempotency_key=(
-                                f"slime:{self.args.modelexpress_model_id}:"
-                                f"{self._base_version_id}:{self.weight_version + 1}"
-                            ),
-                            version_number=self.weight_version + 1,
-                            payload_format=WeightPayloadFormat.XOR_DELTA,
-                            base_version_id=self._base_version_id,
-                            expected_source_slots=["canonical.delta.root"],
-                        )
-                    }
-                except Exception as error:
-                    payload[0] = {"error": f"{type(error).__name__}: {error}"}
-            dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
-            if "error" in payload[0]:
-                raise ModelExpressUpdateError(f"ModelExpress create failed: {payload[0]['error']}")
-            target = payload[0]["version"]
-            staged = self._trainer_client.stage_shard(
-                version=target.ref,
-                hf_tensor_iter=self._iter_hf_buckets(),
+        from modelexpress_rl import WeightPayloadFormat, WeightVersionRef
+
+        phase_started = perf_counter()
+        payload = [None]
+        if dist.get_rank() == 0:
+            payload[0] = self._control_client.create_weight_version(
+                model_name=self.args.modelexpress_model_id,
+                idempotency_key=(
+                    f"slime:{self.args.modelexpress_model_id}:"
+                    f"{self._base_version_id}:{self.weight_version + 1}"
+                ),
+                version_number=self.weight_version + 1,
+                payload_format=WeightPayloadFormat.XOR_DELTA,
+                base_version_id=self._base_version_id,
+                expected_source_slots=["canonical.delta.root"],
             )
-            staged.publish()
-            self._pending_version = target
+        dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
+        target = payload[0]
+        phase_times["perf/mx_control_create_weight_version"] = perf_counter() - phase_started
 
-        if getattr(self._pending_version.state, "value", self._pending_version.state) != "READY":
-            ready_payload = [None]
-            if dist.get_rank() == 0:
-                try:
-                    ready = self._control_client.get_weight_version(self._pending_version.version_id)
-                    if getattr(ready.state, "value", ready.state) != "READY":
-                        raise ModelExpressUpdateError("published ModelExpress target is not READY")
-                    ready_payload[0] = {"version": ready}
-                except Exception as error:
-                    ready_payload[0] = {"error": f"{type(error).__name__}: {error}"}
-            dist.broadcast_object_list(ready_payload, src=0, group=get_gloo_group())
-            if "error" in ready_payload[0]:
-                raise ModelExpressUpdateError(ready_payload[0]["error"])
-            self._pending_version = ready_payload[0]["version"]
+        phase_started = perf_counter()
+        staged = self._trainer_client.stage_shard(
+            version=target.ref,
+            hf_tensor_iter=self._iter_hf_buckets(),
+        )
+        phase_times["perf/mx_stage_shard"] = perf_counter() - phase_started
+
+        phase_started = perf_counter()
+        staged.publish()
+        phase_times["perf/mx_publish_shard"] = perf_counter() - phase_started
+
+        if dist.get_rank() == 0:
+            phase_started = perf_counter()
+            ready = self._control_client.get_weight_version(target.version_id)
+            if getattr(ready.state, "value", ready.state) != "READY":
+                raise ModelExpressUpdateError("published ModelExpress target is not READY")
+            phase_times["perf/mx_control_get_weight_version_ready"] = perf_counter() - phase_started
 
         gloo_group = get_gloo_group()
-        target_version = self._pending_version.version_id
-        if not self._pending_applied:
-            future = None
-            if dist.get_rank() == 0:
-                future = self._activation_executor.submit(self._activate_on_rank_zero, target_version)
-            activation = [None]
-            if future is not None:
-                try:
-                    activation[0] = {"metrics": future.result()}
-                except Exception as error:
-                    activation[0] = {"error": f"{type(error).__name__}: {error}"}
-            dist.broadcast_object_list(activation, src=0, group=gloo_group)
-            if "error" in activation[0]:
-                raise ModelExpressUpdateError(activation[0]["error"])
-            self._pending_receiver_metrics = activation[0]["metrics"]
-            self._pending_applied = True
+        target_version = target.version_id
+        activation_started = None
+        future = None
+        if dist.get_rank() == 0:
+            activation_started = perf_counter()
+            future = self._activation_executor.submit(self._activate_on_rank_zero, target_version)
+        activation = [None]
+        if future is not None:
+            activation[0] = future.result()
+        dist.broadcast_object_list(activation, src=0, group=gloo_group)
+        receiver_metrics = activation[0]
+        if activation_started is not None:
+            phase_times["perf/mx_update_activate_time"] = perf_counter() - activation_started
 
-        previous = self._installed_version
-        if previous is not None:
-            retirement = [None]
+        phase_started = None
+        if self._base_version_id != self.args.modelexpress_base_version_id:
             if dist.get_rank() == 0:
-                try:
-                    self._control_client.delete_weight_version(previous.version_id)
-                    retirement[0] = {"success": True}
-                except Exception as error:
-                    retirement[0] = {"error": f"{type(error).__name__}: {error}"}
-            dist.broadcast_object_list(retirement, src=0, group=gloo_group)
-            if "error" in retirement[0]:
-                raise ModelExpressUpdateError(f"ModelExpress retirement failed: {retirement[0]['error']}")
-            self._trainer_client.release_version(version=previous.ref)
+                phase_started = perf_counter()
+                self._control_client.delete_weight_version(self._base_version_id)
+            dist.barrier(group=gloo_group)
+            self._trainer_client.release_version(version=WeightVersionRef(self._base_version_id))
+        if phase_started is not None:
+            phase_times["perf/mx_update_finalize_time"] = perf_counter() - phase_started
 
-        dist.barrier(group=gloo_group)
         self._base_version_id = target_version
-        self._installed_version = self._pending_version
-        self._pending_version = None
-        self._pending_applied = False
         self.weight_version += 1
-        self._trainer_client.collect_metrics()
-        self._metrics = {
-            **self._trainer_client.pop_metrics(),
-            **self._pending_receiver_metrics,
+        self._metrics = self._gather_metrics(
+            phase_times=phase_times,
+            receiver_metrics=receiver_metrics,
+            group=gloo_group,
+        )
+
+    def _gather_metrics(
+        self,
+        *,
+        phase_times: Mapping[str, float],
+        receiver_metrics: Mapping[str, float],
+        group: Any,
+    ) -> dict[str, float]:
+        local_metrics = self._trainer_client.pop_metrics()
+        counts = torch.tensor(
+            [
+                local_metrics.get("changed_bytes", 0),
+                local_metrics.get("total_bytes", 0),
+                local_metrics.get("wire_bytes", 0),
+            ],
+            dtype=torch.int64,
+        )
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+
+        timings = torch.tensor(
+            [
+                local_metrics.get("stage_delta_time", 0.0),
+                local_metrics.get("publish_s3_time", 0.0),
+                local_metrics.get("publish_server_time", 0.0),
+                *(phase_times[name] for name in _UPDATE_PHASE_METRICS),
+            ],
+            dtype=torch.float64,
+        )
+        dist.all_reduce(timings, op=dist.ReduceOp.MAX, group=group)
+
+        changed_bytes, total_bytes, wire_bytes = counts.tolist()
+        stage_delta_time, publish_s3_time, publish_server_time, *phase_values = timings.tolist()
+        return {
+            "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
+            "perf/update_weights_wire_bytes": wire_bytes,
+            "perf/mx_stage_delta_time": stage_delta_time,
+            "perf/mx_publish_s3_time": publish_s3_time,
+            "perf/mx_publish_server": publish_server_time,
+            **receiver_metrics,
+            **dict(zip(_UPDATE_PHASE_METRICS, phase_values, strict=True)),
         }
-        self._pending_receiver_metrics = {}
 
     def _iter_hf_buckets(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
         for bucket_iter in (
@@ -279,31 +301,10 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
     def _activate_on_rank_zero(self, target_version: str) -> dict[str, float]:
         engines = tuple(self.rollout_engines or ())
-        if not engines:
-            raise ModelExpressUpdateError("ModelExpress requires rollout engines")
-        prepared = _non_null(
-            ray.get([engine.prepare_weights_from_modelexpress.remote(target_version) for engine in engines])
-        )
-        if len(prepared) != len(engines):
-            raise ModelExpressUpdateError("rollout prepare cohort is incomplete")
-        for result in prepared:
-            _require_success(result, operation="prepare", target_version=target_version)
+        prepared = ray.get([engine.prepare_weights_from_modelexpress.remote(target_version) for engine in engines])
         ray.get([engine.pause_generation.remote() for engine in engines])
         ray.get([engine.flush_cache.remote() for engine in engines])
-        installed = _non_null(
-            ray.get([engine.update_weights_from_modelexpress.remote(target_version) for engine in engines])
-        )
-        if len(installed) != len(engines):
-            raise ModelExpressUpdateError("rollout install cohort is incomplete")
-        for result in installed:
-            _require_success(result, operation="install", target_version=target_version)
-            if result.get("installed_version") != target_version:
-                raise ModelExpressUpdateError("receiver installed the wrong version")
-        statuses = _non_null(ray.get([engine.get_modelexpress_status.remote() for engine in engines]))
-        if len(statuses) != len(engines):
-            raise ModelExpressUpdateError("rollout verification cohort is incomplete")
-        for status in statuses:
-            if status.get("installed_version") != target_version or status.get("state") != "VERIFIED":
-                raise ModelExpressUpdateError("receiver status is not VERIFIED")
+        installed = ray.get([engine.update_weights_from_modelexpress.remote(target_version) for engine in engines])
+        ray.get([engine.get_modelexpress_status.remote() for engine in engines])
         ray.get([engine.continue_generation.remote() for engine in engines])
         return _receiver_metrics([*prepared, *installed])
