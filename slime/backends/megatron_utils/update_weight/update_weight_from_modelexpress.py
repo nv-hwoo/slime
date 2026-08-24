@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -13,8 +14,6 @@ from ray.actor import ActorHandle
 
 from slime.utils.distributed_utils import get_gloo_group
 
-from ..megatron_to_hf import convert_to_hf
-from .common import all_gather_param, named_params_and_buffers
 from .update_weight_from_distributed import UpdateWeightFromDistributed
 
 
@@ -56,13 +55,18 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
     ) -> None:
         del weights_getter
         self.args = args
+        if "MX_REFIT_DELTA_BUCKET_BYTES" in os.environ:
+            bucket_bytes = int(os.environ["MX_REFIT_DELTA_BUCKET_BYTES"])
+            if bucket_bytes <= 0:
+                raise ValueError("MX_REFIT_DELTA_BUCKET_BYTES must be positive")
+            self.args.update_weight_buffer_size = bucket_bytes
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = int(args.modelexpress_initial_version)
         self.rollout_engines: Sequence[ActorHandle] | None = None
         self._connection_stale = False
-        self._skip_startup_update = True
+        self._delta_base_prepared = False
         self._base_version_id = args.modelexpress_base_version_id
         self._pending_version = None
         self._pending_applied = False
@@ -163,11 +167,13 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
     @torch.no_grad()
     def update_weights(self) -> None:
-        # Slime invokes the updater once at startup. The explicit READY base
-        # already represents those launch weights, so there is nothing to publish.
-        if self._skip_startup_update:
-            self._skip_startup_update = False
+        if not self._delta_base_prepared:
+            self._trainer_client.prepare_delta_base(
+                hf_tensor_iter=self._iter_hf_buckets(),
+            )
+            self._delta_base_prepared = True
             return
+
         if self.rollout_engines is None:
             raise ModelExpressUpdateError("rollout engines are not connected")
 
@@ -198,7 +204,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
             target = payload[0]["version"]
             staged = self._trainer_client.stage_shard(
                 version=target.ref,
-                hf_tensor_iter=self._iter_hf_tensors(),
+                hf_tensor_iter=self._iter_hf_buckets(),
             )
             staged.publish()
             self._pending_version = target
@@ -263,34 +269,13 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         }
         self._pending_receiver_metrics = {}
 
-    def _iter_hf_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for tensor_iter in (
-            self._iter_non_expert_tensors(),
-            self._iter_expert_tensors(),
+    def _iter_hf_buckets(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        for bucket_iter in (
+            self._iter_non_expert_chunks(),
+            self._iter_expert_chunks(),
         ):
-            yield from tensor_iter
+            yield from bucket_iter
             dist.barrier(group=get_gloo_group())
-
-    def _iter_non_expert_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." in name:
-                continue
-            param = all_gather_param(name, param)
-            if self._is_pp_src_rank:
-                yield from convert_to_hf(
-                    self.args,
-                    self.model_name,
-                    name,
-                    param,
-                    self.quantization_config,
-                )
-
-    def _iter_expert_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." not in name:
-                continue
-            param = all_gather_param(name, param)
-            yield from self._ep_gather_and_convert([(name, param)])
 
     def _activate_on_rank_zero(self, target_version: str) -> dict[str, float]:
         engines = tuple(self.rollout_engines or ())
