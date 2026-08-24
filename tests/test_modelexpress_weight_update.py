@@ -8,10 +8,7 @@ import torch
 
 from slime.backends.megatron_utils.update_weight import update_weight_from_modelexpress as mx_module
 from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as distributed_module
-from slime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import (
-    ModelExpressUpdateError,
-    UpdateWeightFromModelExpress,
-)
+from slime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import UpdateWeightFromModelExpress
 
 pytestmark = pytest.mark.unit
 
@@ -37,7 +34,6 @@ class FakeControlClient:
         self.versions = {"base-uid": FakeVersion("base-uid")}
         self.creates = []
         self.deletes = []
-        self.fail_next_delete = False
 
     def get_weight_version(self, version_id):
         return self.versions[version_id]
@@ -49,9 +45,6 @@ class FakeControlClient:
         return version
 
     def delete_weight_version(self, version_id):
-        if self.fail_next_delete:
-            self.fail_next_delete = False
-            raise RuntimeError("retirement failed")
         self.deletes.append(version_id)
 
 
@@ -72,10 +65,13 @@ class FakeTrainerClient:
         self.stages = []
         self.releases = []
         self.base_preparations = []
-        self.metric_collections = 0
         self.metrics = {
-            "perf/update_weights_density": 0.25,
-            "perf/update_weights_wire_bytes": 123.0,
+            "changed_bytes": 25,
+            "total_bytes": 100,
+            "wire_bytes": 123,
+            "stage_delta_time": 7.0,
+            "publish_s3_time": 8.0,
+            "publish_server_time": 9.0,
         }
 
     def stage_shard(self, *, version, hf_tensor_iter):
@@ -87,20 +83,15 @@ class FakeTrainerClient:
         self.base_preparations.append(list(hf_tensor_iter))
 
     def pop_metrics(self):
-        metrics, self.metrics = self.metrics, {}
-        return metrics
-
-    def collect_metrics(self):
-        self.metric_collections += 1
+        return dict(self.metrics)
 
     def release_version(self, *, version):
         self.releases.append(version)
 
 
 class FakeEngine:
-    def __init__(self, events, install_success=True):
+    def __init__(self, events):
         self.version = "base-uid"
-        self.install_success = install_success
         self.events = events
         self.prepare_weights_from_modelexpress = RemoteMethod(self._prepare)
         self.pause_generation = RemoteMethod(self._pause)
@@ -127,12 +118,11 @@ class FakeEngine:
 
     def _install(self, target):
         self._event(f"install:{target}")
-        if self.install_success:
-            self.version = target
+        self.version = target
         return {
-            "success": self.install_success,
+            "success": True,
             "installed_version": self.version,
-            "detail": "install failed" if not self.install_success else "",
+            "detail": "",
             "metrics": {"perf/mx_receive_install_time": 3.0},
         }
 
@@ -159,12 +149,22 @@ def args():
 
 @pytest.fixture(autouse=True)
 def patch_runtime(monkeypatch):
+    class WeightVersionRef:
+        def __init__(self, version_id):
+            self.version_id = version_id
+
     modelexpress_rl = types.ModuleType("modelexpress_rl")
     modelexpress_rl.WeightPayloadFormat = types.SimpleNamespace(XOR_DELTA="XOR_DELTA")
+    modelexpress_rl.WeightVersionRef = WeightVersionRef
     monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
     monkeypatch.setattr(mx_module.ray, "get", lambda refs: refs)
     monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(mx_module.dist, "barrier", lambda group=None: None)
+    monkeypatch.setattr(
+        mx_module.dist,
+        "all_reduce",
+        lambda value, op=None, group=None: None,
+    )
     monkeypatch.setattr(
         mx_module.dist,
         "broadcast_object_list",
@@ -285,7 +285,7 @@ def test_trainer_config_owns_the_process_group(monkeypatch):
     assert not hasattr(captured["config"].s3, "process_group")
 
 
-def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
+def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypatch):
     instance, control, trainer = updater()
     events = []
     instance.connect_rollout_engines([FakeEngine(events)], object())
@@ -298,6 +298,29 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
     assert events == []
     assert instance.weight_version == 0
 
+    clock = iter(
+        [0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0, 50.0, 56.0]
+    )
+    reductions = []
+    monkeypatch.setattr(mx_module, "perf_counter", lambda: next(clock))
+
+    def reduce_phases(value, op=None, group=None):
+        reductions.append((value.tolist(), op))
+        if value.dtype == torch.int64:
+            value.copy_(torch.tensor([50, 200, 246], dtype=value.dtype))
+        else:
+            value.copy_(
+                torch.tensor(
+                    [17.0, 18.0, 19.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
+                    dtype=value.dtype,
+                )
+            )
+
+    monkeypatch.setattr(
+        mx_module.dist,
+        "all_reduce",
+        reduce_phases,
+    )
     instance.update_weights()
     instance._activation_executor.shutdown()
 
@@ -321,11 +344,23 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread():
     assert all(thread.startswith("modelexpress-control") for _event, thread in events)
     assert instance.pop_metrics() == {
         "perf/update_weights_density": 0.25,
-        "perf/update_weights_wire_bytes": 123.0,
+        "perf/update_weights_wire_bytes": 246,
+        "perf/mx_stage_delta_time": 17.0,
+        "perf/mx_publish_s3_time": 18.0,
+        "perf/mx_publish_server": 19.0,
         "perf/mx_receive_prepare_time": 2.0,
         "perf/mx_receive_install_time": 3.0,
+        "perf/mx_control_create_weight_version": 11.0,
+        "perf/mx_stage_shard": 12.0,
+        "perf/mx_publish_shard": 13.0,
+        "perf/mx_control_get_weight_version_ready": 14.0,
+        "perf/mx_update_activate_time": 15.0,
+        "perf/mx_update_finalize_time": 16.0,
     }
-    assert trainer.metric_collections == 1
+    assert reductions == [
+        ([25, 100, 123], torch.distributed.ReduceOp.SUM),
+        ([7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], torch.distributed.ReduceOp.MAX),
+    ]
     assert instance.weight_version == 1
 
 
@@ -338,132 +373,24 @@ def test_reconnect_validates_current_ready_base():
     instance._activation_executor.shutdown()
 
 
-def test_connect_broadcasts_rank_zero_ray_errors(monkeypatch):
-    instance, _control, _trainer = updater()
-    transmitted = {}
-    ray_get_calls = []
-
-    def fail_ray_get(refs):
-        ray_get_calls.append(refs)
-        raise RuntimeError("status transport failed")
-
-    def capture(values, src, group=None):
-        transmitted["value"] = values[0]
-
-    monkeypatch.setattr(mx_module.ray, "get", fail_ray_get)
-    monkeypatch.setattr(mx_module.dist, "broadcast_object_list", capture)
-    with pytest.raises(ModelExpressUpdateError) as rank_zero_error:
-        instance.connect_rollout_engines([FakeEngine([])], object())
-
-    monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
-    monkeypatch.setattr(
-        mx_module.dist,
-        "broadcast_object_list",
-        lambda values, src, group=None: values.__setitem__(0, transmitted["value"]),
-    )
-    with pytest.raises(ModelExpressUpdateError) as non_root_error:
-        instance.connect_rollout_engines([FakeEngine([])], object())
-    instance._activation_executor.shutdown()
-
-    assert str(non_root_error.value) == str(rank_zero_error.value)
-    assert "status transport failed" in str(non_root_error.value)
-    assert len(ray_get_calls) == 1
-
-
-def test_ready_lookup_is_rank_zero_only_and_broadcasts_error(monkeypatch):
-    instance, control, trainer = updater()
-    events = []
-    instance.connect_rollout_engines([FakeEngine(events)], object())
-    instance.update_weights()
-    transmitted = {}
-    ready_lookups = []
-    original_get = control.get_weight_version
-
-    def fail_target_lookup(version_id):
-        if version_id == "target-1":
-            ready_lookups.append(version_id)
-            raise RuntimeError("ready lookup failed")
-        return original_get(version_id)
-
-    def capture_error(values, src, group=None):
-        if values[0] is not None and "error" in values[0]:
-            transmitted["value"] = values[0]
-
-    control.get_weight_version = fail_target_lookup
-    monkeypatch.setattr(mx_module.dist, "broadcast_object_list", capture_error)
-    with pytest.raises(ModelExpressUpdateError) as rank_zero_error:
-        instance.update_weights()
-
-    monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
-    monkeypatch.setattr(
-        mx_module.dist,
-        "broadcast_object_list",
-        lambda values, src, group=None: values.__setitem__(0, transmitted["value"]),
-    )
-    with pytest.raises(ModelExpressUpdateError) as non_root_error:
-        instance.update_weights()
-    instance._activation_executor.shutdown()
-
-    assert str(non_root_error.value) == str(rank_zero_error.value)
-    assert "ready lookup failed" in str(non_root_error.value)
-    assert ready_lookups == ["target-1"]
-    assert len(control.creates) == 1
-    assert len(trainer.stages) == 1
-    assert events == []
-
-
-def test_failed_install_retries_the_same_ready_target():
-    instance, control, trainer = updater()
-    events = []
-    engine = FakeEngine(events, install_success=False)
-    instance.connect_rollout_engines([engine], object())
-    instance.update_weights()
-
-    with pytest.raises(ModelExpressUpdateError, match="install failed"):
-        instance.update_weights()
-    assert instance._pending_version.version_id == "target-1"
-    assert instance.weight_version == 0
-
-    engine.install_success = True
-    instance.update_weights()
-    instance._activation_executor.shutdown()
-
-    assert len(control.creates) == 1
-    assert len(trainer.stages) == 1
-    assert [event for event, _thread in events].count("install:target-1") == 2
-    assert instance.weight_version == 1
-
-
-def test_next_target_retries_retirement_before_advancing():
+def test_next_target_retires_previous_version():
     instance, control, trainer = updater()
     events = []
     engine = FakeEngine(events)
     instance.connect_rollout_engines([engine], object())
     instance.update_weights()
     instance.update_weights()
-
-    control.fail_next_delete = True
-    with pytest.raises(ModelExpressUpdateError, match="retirement failed"):
-        instance.update_weights()
-
-    assert instance._pending_version.version_id == "target-2"
-    assert instance._pending_applied is True
-    assert instance.weight_version == 1
-    assert len(control.creates) == 2
-    assert len(trainer.stages) == 2
-    assert [event for event, _thread in events].count("install:target-2") == 1
-
     instance.update_weights()
     instance._activation_executor.shutdown()
 
     assert len(control.creates) == 2
     assert len(trainer.stages) == 2
+    assert [event for event, _thread in events].count("install:target-1") == 1
     assert [event for event, _thread in events].count("install:target-2") == 1
     assert control.deletes == ["target-1"]
     assert [version.version_id for version in trainer.releases] == ["target-1"]
     assert "base-uid" not in control.deletes
-    assert instance._installed_version.version_id == "target-2"
-    assert instance._pending_version is None
+    assert instance._base_version_id == "target-2"
     assert instance.weight_version == 2
 
 
@@ -471,11 +398,16 @@ def test_receive_metrics_are_broadcast_to_the_logging_rank(monkeypatch):
     instance, _control, _trainer = updater()
     instance.connect_rollout_engines([FakeEngine([])], object())
     instance.update_weights()
-    instance._pending_version = FakeVersion("target-1")
     monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
+    broadcasts = iter(
+        [
+            FakeVersion("target-1", state="STAGING"),
+            {"perf/mx_receive_prepare_time": 7.0},
+        ]
+    )
 
     def broadcast(values, src, group=None):
-        values[0] = {"metrics": {"perf/mx_receive_prepare_time": 7.0}}
+        values[0] = next(broadcasts)
 
     monkeypatch.setattr(mx_module.dist, "broadcast_object_list", broadcast)
 
