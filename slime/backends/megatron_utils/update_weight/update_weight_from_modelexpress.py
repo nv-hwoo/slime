@@ -47,7 +47,6 @@ _UPDATE_PHASE_METRICS = (
     "perf/mx_publish_shard",
     "perf/mx_control_get_weight_version_ready",
     "perf/mx_update_activate_time",
-    "perf/mx_update_finalize_time",
 )
 
 
@@ -179,7 +178,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
         phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
 
-        from modelexpress_rl import WeightPayloadFormat, WeightVersionRef
+        from modelexpress_rl import WeightPayloadFormat
 
         phase_started = perf_counter()
         payload = [None]
@@ -231,16 +230,6 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         receiver_metrics = activation[0]
         if activation_started is not None:
             phase_times["perf/mx_update_activate_time"] = perf_counter() - activation_started
-
-        phase_started = None
-        if self._base_version_id != self.args.modelexpress_base_version_id:
-            if dist.get_rank() == 0:
-                phase_started = perf_counter()
-                self._control_client.delete_weight_version(self._base_version_id)
-            dist.barrier(group=gloo_group)
-            self._trainer_client.release_version(version=WeightVersionRef(self._base_version_id))
-        if phase_started is not None:
-            phase_times["perf/mx_update_finalize_time"] = perf_counter() - phase_started
 
         self._base_version_id = target_version
         self.weight_version += 1

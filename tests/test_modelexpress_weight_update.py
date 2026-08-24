@@ -299,7 +299,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
     assert instance.weight_version == 0
 
     clock = iter(
-        [0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0, 50.0, 56.0]
+        [0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0]
     )
     reductions = []
     monkeypatch.setattr(mx_module, "perf_counter", lambda: next(clock))
@@ -311,7 +311,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
         else:
             value.copy_(
                 torch.tensor(
-                    [17.0, 18.0, 19.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
+                    [17.0, 18.0, 19.0, 11.0, 12.0, 13.0, 14.0, 15.0],
                     dtype=value.dtype,
                 )
             )
@@ -355,11 +355,10 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
         "perf/mx_publish_shard": 13.0,
         "perf/mx_control_get_weight_version_ready": 14.0,
         "perf/mx_update_activate_time": 15.0,
-        "perf/mx_update_finalize_time": 16.0,
     }
     assert reductions == [
         ([25, 100, 123], torch.distributed.ReduceOp.SUM),
-        ([7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], torch.distributed.ReduceOp.MAX),
+        ([7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 4.0, 5.0], torch.distributed.ReduceOp.MAX),
     ]
     assert instance.weight_version == 1
 
@@ -373,7 +372,7 @@ def test_reconnect_validates_current_ready_base():
     instance._activation_executor.shutdown()
 
 
-def test_next_target_retires_previous_version():
+def test_next_target_keeps_previous_version():
     instance, control, trainer = updater()
     events = []
     engine = FakeEngine(events)
@@ -387,9 +386,8 @@ def test_next_target_retires_previous_version():
     assert len(trainer.stages) == 2
     assert [event for event, _thread in events].count("install:target-1") == 1
     assert [event for event, _thread in events].count("install:target-2") == 1
-    assert control.deletes == ["target-1"]
-    assert [version.version_id for version in trainer.releases] == ["target-1"]
-    assert "base-uid" not in control.deletes
+    assert control.deletes == []
+    assert trainer.releases == []
     assert instance._base_version_id == "target-2"
     assert instance.weight_version == 2
 
