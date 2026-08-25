@@ -45,9 +45,8 @@ def test_modelexpress_private_startup_config_reaches_sglang(monkeypatch):
         modelexpress_model_id="policy",
         modelexpress_preparation_cache_dir="/models/mx-cache",
         modelexpress_server_url="dns:///modelexpress:8001",
-        modelexpress_s3_bucket="weights",
         modelexpress_s3_endpoint=None,
-        modelexpress_s3_prefix="run/policy",
+        modelexpress_s3_uri_prefix="s3://weights/run/policy",
         num_gpus_per_node=8,
         offload_rollout=False,
         rollout_num_gpus_per_engine=1,
@@ -71,7 +70,6 @@ def test_modelexpress_private_startup_config_reaches_sglang(monkeypatch):
 
     assert server_args["modelexpress_model_name"] == "policy"
     assert server_args["modelexpress_server_url"] == "dns:///modelexpress:8001"
-    assert "modelexpress_delta_s3_bucket" not in server_args
-    assert "modelexpress_delta_s3_prefix" not in server_args
+    assert "modelexpress_s3_uri_prefix" not in server_args
     assert server_args["modelexpress_initial_base_version_id"] == "base-a"
     assert server_args["modelexpress_preparation_cache_dir"] == "/models/mx-cache"

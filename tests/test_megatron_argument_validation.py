@@ -261,7 +261,7 @@ def make_slime_validate_args(**overrides):
         modelexpress_model_id=None,
         modelexpress_server_url=None,
         modelexpress_base_version_id=None,
-        modelexpress_s3_bucket=None,
+        modelexpress_s3_uri_prefix=None,
         modelexpress_preparation_cache_dir=None,
         modelexpress_initial_version="0",
         rollout_external=False,
@@ -428,7 +428,7 @@ def test_modelexpress_requires_refit_server_and_ready_base(monkeypatch):
     args = make_slime_validate_args(
         update_weight_backend="modelexpress",
         modelexpress_model_id="policy",
-        modelexpress_s3_bucket="weights",
+        modelexpress_s3_uri_prefix="s3://weights/run/policy",
         modelexpress_preparation_cache_dir="/mxdelta/mxprep",
     )
 
@@ -444,7 +444,7 @@ def test_modelexpress_does_not_require_native_disk_configuration(monkeypatch):
         modelexpress_model_id="policy",
         modelexpress_server_url="dns:///modelexpress:8001",
         modelexpress_base_version_id="launch-ready-uid",
-        modelexpress_s3_bucket="weights",
+        modelexpress_s3_uri_prefix="s3://weights/run/policy",
         modelexpress_preparation_cache_dir="/mxdelta/mxprep",
     )
 
