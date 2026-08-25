@@ -33,6 +33,7 @@ class FakeControlClient:
     def __init__(self):
         self.versions = {"base-uid": FakeVersion("base-uid")}
         self.creates = []
+        self.state_updates = []
         self.deletes = []
 
     def get_weight_version(self, version_id):
@@ -43,6 +44,10 @@ class FakeControlClient:
         version = FakeVersion(f"target-{kwargs['version_number']}", state="STAGING")
         self.versions[version.version_id] = version
         return version
+
+    def update_weight_version_state(self, version_id, state):
+        self.state_updates.append((version_id, state))
+        self.versions[version_id] = FakeVersion(version_id, state=state)
 
     def delete_weight_version(self, version_id):
         self.deletes.append(version_id)
@@ -56,7 +61,6 @@ class FakeStagedShard:
 
     def publish(self):
         self.publish_count += 1
-        self.control.versions[self.version_id] = FakeVersion(self.version_id)
 
 
 class FakeTrainerClient:
@@ -71,7 +75,6 @@ class FakeTrainerClient:
             "wire_bytes": 123,
             "stage_delta_time": 7.0,
             "publish_s3_time": 8.0,
-            "publish_server_time": 9.0,
         }
 
     def stage_shard(self, *, version, hf_tensor_iter):
@@ -144,6 +147,8 @@ def args():
         modelexpress_initial_version="0",
         modelexpress_model_id="policy",
         modelexpress_base_version_id="base-uid",
+        modelexpress_s3_endpoint=None,
+        modelexpress_s3_uri_prefix="s3://weights/run/policy",
     )
 
 
@@ -153,8 +158,14 @@ def patch_runtime(monkeypatch):
         def __init__(self, version_id):
             self.version_id = version_id
 
+    class S3Config(types.SimpleNamespace):
+        def root_uri(self, version_number):
+            return f"{self.uri_prefix.rstrip('/')}/v{version_number}/model.safetensors.index.json"
+
     modelexpress_rl = types.ModuleType("modelexpress_rl")
+    modelexpress_rl.S3Config = S3Config
     modelexpress_rl.WeightPayloadFormat = types.SimpleNamespace(XOR_DELTA="XOR_DELTA")
+    modelexpress_rl.WeightVersionState = types.SimpleNamespace(STAGING="STAGING", READY="READY")
     modelexpress_rl.WeightVersionRef = WeightVersionRef
     monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
     monkeypatch.setattr(mx_module.ray, "get", lambda refs: refs)
@@ -267,8 +278,7 @@ def test_trainer_config_owns_the_process_group(monkeypatch):
     monkeypatch.setattr(mx_module, "get_gloo_group", lambda: gloo_group)
     config_args = args()
     config_args.modelexpress_server_url = "dns:///modelexpress:8001"
-    config_args.modelexpress_s3_bucket = "weights"
-    config_args.modelexpress_s3_prefix = ""
+    config_args.modelexpress_s3_uri_prefix = "s3://weights/run/policy"
     config_args.modelexpress_s3_endpoint = None
     config_args.update_weight_buffer_size = 1024
 
@@ -283,6 +293,7 @@ def test_trainer_config_owns_the_process_group(monkeypatch):
 
     assert captured["config"].process_group is gloo_group
     assert not hasattr(captured["config"].s3, "process_group")
+    assert captured["config"].s3.uri_prefix == "s3://weights/run/policy"
 
 
 def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypatch):
@@ -311,7 +322,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
         else:
             value.copy_(
                 torch.tensor(
-                    [17.0, 18.0, 19.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+                    [17.0, 18.0, 11.0, 12.0, 13.0, 14.0, 15.0],
                     dtype=value.dtype,
                 )
             )
@@ -332,9 +343,11 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
             "version_number": 1,
             "payload_format": "XOR_DELTA",
             "base_version_id": "base-uid",
-            "expected_source_slots": ["canonical.delta.root"],
+            "s3_uri": "s3://weights/run/policy/v1/model.safetensors.index.json",
+            "state": "STAGING",
         }
     ]
+    assert control.state_updates == [("target-1", "READY")]
     assert trainer.stages[0][0].version_id == "target-1"
     assert iter(trainer.stages[0][1]) is trainer.stages[0][1]
     assert trainer.stages[0][2] == main
@@ -347,18 +360,17 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
         "perf/update_weights_wire_bytes": 246,
         "perf/mx_stage_delta_time": 17.0,
         "perf/mx_publish_s3_time": 18.0,
-        "perf/mx_publish_server": 19.0,
+        "perf/mx_publish_server": 14.0,
         "perf/mx_receive_prepare_time": 2.0,
         "perf/mx_receive_install_time": 3.0,
         "perf/mx_control_create_weight_version": 11.0,
         "perf/mx_stage_shard": 12.0,
         "perf/mx_publish_shard": 13.0,
-        "perf/mx_control_get_weight_version_ready": 14.0,
         "perf/mx_update_activate_time": 15.0,
     }
     assert reductions == [
         ([25, 100, 123], torch.distributed.ReduceOp.SUM),
-        ([7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 4.0, 5.0], torch.distributed.ReduceOp.MAX),
+        ([7.0, 8.0, 1.0, 2.0, 3.0, 4.0, 5.0], torch.distributed.ReduceOp.MAX),
     ]
     assert instance.weight_version == 1
 
@@ -383,6 +395,7 @@ def test_next_target_keeps_previous_version():
     instance._activation_executor.shutdown()
 
     assert len(control.creates) == 2
+    assert control.state_updates == [("target-1", "READY"), ("target-2", "READY")]
     assert len(trainer.stages) == 2
     assert [event for event, _thread in events].count("install:target-1") == 1
     assert [event for event, _thread in events].count("install:target-2") == 1

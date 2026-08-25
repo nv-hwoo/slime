@@ -138,8 +138,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--modelexpress-server-url", type=str, default=None)
             parser.add_argument("--modelexpress-base-version-id", type=str, default=None)
             parser.add_argument("--modelexpress-s3-endpoint", type=str, default=None)
-            parser.add_argument("--modelexpress-s3-bucket", type=str, default=None)
-            parser.add_argument("--modelexpress-s3-prefix", type=str, default="")
+            parser.add_argument("--modelexpress-s3-uri-prefix", type=str, default=None)
             parser.add_argument("--modelexpress-preparation-cache-dir", type=str, default=None)
             parser.add_argument("--modelexpress-initial-version", type=str, default="0")
             parser.add_argument(
@@ -2064,7 +2063,7 @@ def slime_validate_args(args):
             "--modelexpress-model-id": args.modelexpress_model_id,
             "--modelexpress-server-url": args.modelexpress_server_url,
             "--modelexpress-base-version-id": args.modelexpress_base_version_id,
-            "--modelexpress-s3-bucket": args.modelexpress_s3_bucket,
+            "--modelexpress-s3-uri-prefix": args.modelexpress_s3_uri_prefix,
             "--modelexpress-preparation-cache-dir": args.modelexpress_preparation_cache_dir,
         }
         missing = [name for name, value in required.items() if not value]

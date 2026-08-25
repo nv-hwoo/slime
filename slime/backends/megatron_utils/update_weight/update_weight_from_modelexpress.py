@@ -45,7 +45,7 @@ _UPDATE_PHASE_METRICS = (
     "perf/mx_control_create_weight_version",
     "perf/mx_stage_shard",
     "perf/mx_publish_shard",
-    "perf/mx_control_get_weight_version_ready",
+    "perf/mx_publish_server",
     "perf/mx_update_activate_time",
 )
 
@@ -79,12 +79,19 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         self._delta_base_prepared = False
         self._base_version_id = args.modelexpress_base_version_id
 
+        from modelexpress_rl import S3Config
+
+        self._s3_config = S3Config(
+            uri_prefix=args.modelexpress_s3_uri_prefix,
+            endpoint_url=args.modelexpress_s3_endpoint,
+            initial_base_version_id=self._base_version_id,
+            launch_checkpoint=args.hf_checkpoint,
+        )
         if control_client is None or trainer_client is None:
             from modelexpress_rl import (
                 ModelExpressControlClient,
                 ModelExpressTrainerClient,
                 ModelExpressTrainerConfig,
-                S3Config,
                 TrainerStagingMode,
                 WeightPayloadFormat,
             )
@@ -106,13 +113,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
                     staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
                     payload_format=WeightPayloadFormat.XOR_DELTA,
                     process_group=get_gloo_group(),
-                    s3=S3Config(
-                        bucket=args.modelexpress_s3_bucket,
-                        prefix=args.modelexpress_s3_prefix,
-                        endpoint_url=args.modelexpress_s3_endpoint,
-                        initial_base_version_id=self._base_version_id,
-                        launch_checkpoint=args.hf_checkpoint,
-                    ),
+                    s3=self._s3_config,
                 )
             )
         self._trainer_client = trainer_client
@@ -178,21 +179,23 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
         phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
 
-        from modelexpress_rl import WeightPayloadFormat
+        from modelexpress_rl import WeightPayloadFormat, WeightVersionState
 
         phase_started = perf_counter()
         payload = [None]
         if dist.get_rank() == 0:
+            version_number = self.weight_version + 1
             payload[0] = self._control_client.create_weight_version(
                 model_name=self.args.modelexpress_model_id,
                 idempotency_key=(
                     f"slime:{self.args.modelexpress_model_id}:"
-                    f"{self._base_version_id}:{self.weight_version + 1}"
+                    f"{self._base_version_id}:{version_number}"
                 ),
-                version_number=self.weight_version + 1,
+                version_number=version_number,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 base_version_id=self._base_version_id,
-                expected_source_slots=["canonical.delta.root"],
+                s3_uri=self._s3_config.root_uri(version_number),
+                state=WeightVersionState.STAGING,
             )
         dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
         target = payload[0]
@@ -211,10 +214,11 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
         if dist.get_rank() == 0:
             phase_started = perf_counter()
-            ready = self._control_client.get_weight_version(target.version_id)
-            if getattr(ready.state, "value", ready.state) != "READY":
-                raise ModelExpressUpdateError("published ModelExpress target is not READY")
-            phase_times["perf/mx_control_get_weight_version_ready"] = perf_counter() - phase_started
+            self._control_client.update_weight_version_state(
+                target.version_id,
+                WeightVersionState.READY,
+            )
+            phase_times["perf/mx_publish_server"] = perf_counter() - phase_started
 
         gloo_group = get_gloo_group()
         target_version = target.version_id
@@ -261,7 +265,6 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
             [
                 local_metrics.get("stage_delta_time", 0.0),
                 local_metrics.get("publish_s3_time", 0.0),
-                local_metrics.get("publish_server_time", 0.0),
                 *(phase_times[name] for name in _UPDATE_PHASE_METRICS),
             ],
             dtype=torch.float64,
@@ -269,13 +272,12 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         dist.all_reduce(timings, op=dist.ReduceOp.MAX, group=group)
 
         changed_bytes, total_bytes, wire_bytes = counts.tolist()
-        stage_delta_time, publish_s3_time, publish_server_time, *phase_values = timings.tolist()
+        stage_delta_time, publish_s3_time, *phase_values = timings.tolist()
         return {
             "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
             "perf/update_weights_wire_bytes": wire_bytes,
             "perf/mx_stage_delta_time": stage_delta_time,
             "perf/mx_publish_s3_time": publish_s3_time,
-            "perf/mx_publish_server": publish_server_time,
             **receiver_metrics,
             **dict(zip(_UPDATE_PHASE_METRICS, phase_values, strict=True)),
         }
