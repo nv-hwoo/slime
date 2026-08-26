@@ -74,7 +74,7 @@ class FakeTrainerClient:
             "total_bytes": 100,
             "wire_bytes": 123,
             "stage_delta_time": 7.0,
-            "publish_s3_time": 8.0,
+            "publish_object_storage_time": 8.0,
         }
 
     def stage_shard(self, *, version, hf_tensor_iter):
@@ -158,12 +158,17 @@ def patch_runtime(monkeypatch):
         def __init__(self, version_id):
             self.version_id = version_id
 
-    class S3Config(types.SimpleNamespace):
+    class ObjectStorageConfig(types.SimpleNamespace):
         def root_uri(self, version_number):
             return f"{self.uri_prefix.rstrip('/')}/v{version_number}/model.safetensors.index.json"
 
+    class ObjectStorageSource(types.SimpleNamespace):
+        pass
+
     modelexpress_rl = types.ModuleType("modelexpress_rl")
-    modelexpress_rl.S3Config = S3Config
+    modelexpress_rl.ObjectStorageConfig = ObjectStorageConfig
+    modelexpress_rl.ObjectStorageSource = ObjectStorageSource
+    modelexpress_rl.ObjectStorageType = types.SimpleNamespace(S3="S3")
     modelexpress_rl.WeightPayloadFormat = types.SimpleNamespace(XOR_DELTA="XOR_DELTA")
     modelexpress_rl.WeightVersionState = types.SimpleNamespace(STAGING="STAGING", READY="READY")
     modelexpress_rl.WeightVersionRef = WeightVersionRef
@@ -271,7 +276,9 @@ def test_trainer_config_owns_the_process_group(monkeypatch):
     modelexpress_rl.ModelExpressControlClient = ControlClient
     modelexpress_rl.ModelExpressTrainerClient = TrainerClient
     modelexpress_rl.ModelExpressTrainerConfig = Config
-    modelexpress_rl.S3Config = Config
+    modelexpress_rl.ObjectStorageConfig = Config
+    modelexpress_rl.ObjectStorageSource = Config
+    modelexpress_rl.ObjectStorageType = types.SimpleNamespace(S3="S3")
     modelexpress_rl.TrainerStagingMode = types.SimpleNamespace(WRITE_TO_STORAGE="WRITE_TO_STORAGE")
     modelexpress_rl.WeightPayloadFormat = types.SimpleNamespace(XOR_DELTA="XOR_DELTA")
     monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
@@ -292,8 +299,9 @@ def test_trainer_config_owns_the_process_group(monkeypatch):
     instance._activation_executor.shutdown()
 
     assert captured["config"].process_group is gloo_group
-    assert not hasattr(captured["config"].s3, "process_group")
-    assert captured["config"].s3.uri_prefix == "s3://weights/run/policy"
+    assert not hasattr(captured["config"].object_storage, "process_group")
+    assert captured["config"].object_storage.storage_type == "S3"
+    assert captured["config"].object_storage.uri_prefix == "s3://weights/run/policy"
 
 
 def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypatch):
@@ -343,7 +351,10 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
             "version_number": 1,
             "payload_format": "XOR_DELTA",
             "base_version_id": "base-uid",
-            "s3_uri": "s3://weights/run/policy/v1/model.safetensors.index.json",
+            "object_storage": types.SimpleNamespace(
+                storage_type="S3",
+                uri="s3://weights/run/policy/v1/model.safetensors.index.json",
+            ),
             "state": "STAGING",
         }
     ]
@@ -359,7 +370,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
         "perf/update_weights_density": 0.25,
         "perf/update_weights_wire_bytes": 246,
         "perf/mx_stage_delta_time": 17.0,
-        "perf/mx_publish_s3_time": 18.0,
+        "perf/mx_publish_object_storage_time": 18.0,
         "perf/mx_publish_server": 14.0,
         "perf/mx_receive_prepare_time": 2.0,
         "perf/mx_receive_install_time": 3.0,
