@@ -79,9 +79,10 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         self._delta_base_prepared = False
         self._base_version_id = args.modelexpress_base_version_id
 
-        from modelexpress_rl import S3Config
+        from modelexpress_rl import ObjectStorageConfig, ObjectStorageType
 
-        self._s3_config = S3Config(
+        self._object_storage_config = ObjectStorageConfig(
+            storage_type=ObjectStorageType.S3,
             uri_prefix=args.modelexpress_s3_uri_prefix,
             endpoint_url=args.modelexpress_s3_endpoint,
             initial_base_version_id=self._base_version_id,
@@ -113,7 +114,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
                     staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
                     payload_format=WeightPayloadFormat.XOR_DELTA,
                     process_group=get_gloo_group(),
-                    s3=self._s3_config,
+                    object_storage=self._object_storage_config,
                 )
             )
         self._trainer_client = trainer_client
@@ -179,7 +180,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
 
         phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
 
-        from modelexpress_rl import WeightPayloadFormat, WeightVersionState
+        from modelexpress_rl import ObjectStorageSource, WeightPayloadFormat, WeightVersionState
 
         phase_started = perf_counter()
         payload = [None]
@@ -194,7 +195,10 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
                 version_number=version_number,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 base_version_id=self._base_version_id,
-                s3_uri=self._s3_config.root_uri(version_number),
+                object_storage=ObjectStorageSource(
+                    storage_type=self._object_storage_config.storage_type,
+                    uri=self._object_storage_config.root_uri(version_number),
+                ),
                 state=WeightVersionState.STAGING,
             )
         dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
@@ -264,7 +268,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         timings = torch.tensor(
             [
                 local_metrics.get("stage_delta_time", 0.0),
-                local_metrics.get("publish_s3_time", 0.0),
+                local_metrics.get("publish_object_storage_time", 0.0),
                 *(phase_times[name] for name in _UPDATE_PHASE_METRICS),
             ],
             dtype=torch.float64,
@@ -272,12 +276,12 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         dist.all_reduce(timings, op=dist.ReduceOp.MAX, group=group)
 
         changed_bytes, total_bytes, wire_bytes = counts.tolist()
-        stage_delta_time, publish_s3_time, *phase_values = timings.tolist()
+        stage_delta_time, publish_object_storage_time, *phase_values = timings.tolist()
         return {
             "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
             "perf/update_weights_wire_bytes": wire_bytes,
             "perf/mx_stage_delta_time": stage_delta_time,
-            "perf/mx_publish_s3_time": publish_s3_time,
+            "perf/mx_publish_object_storage_time": publish_object_storage_time,
             **receiver_metrics,
             **dict(zip(_UPDATE_PHASE_METRICS, phase_values, strict=True)),
         }
