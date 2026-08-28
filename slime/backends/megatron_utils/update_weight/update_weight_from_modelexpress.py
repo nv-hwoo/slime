@@ -147,9 +147,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         )
         expected_version = self._base_version_id
         if dist.get_rank() == 0:
-            statuses = _non_null(
-                ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines])
-            )
+            statuses = _non_null(ray.get([engine.get_modelexpress_status.remote() for engine in self.rollout_engines]))
             if len(statuses) != len(self.rollout_engines):
                 raise ModelExpressUpdateError("rollout launch cohort is incomplete")
             for status in statuses:
@@ -186,18 +184,21 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         payload = [None]
         if dist.get_rank() == 0:
             version_number = self.weight_version + 1
+            object_storage_uri = (
+                f"{self._object_storage_config.uri_prefix.rstrip('/')}/v{version_number}/"
+                "model.safetensors.index.json"
+            )
             payload[0] = self._control_client.create_weight_version(
+                uid=f"v{version_number}",
                 model_name=self.args.modelexpress_model_id,
                 idempotency_key=(
-                    f"slime:{self.args.modelexpress_model_id}:"
-                    f"{self._base_version_id}:{version_number}"
+                    f"slime:{self.args.modelexpress_model_id}:" f"{self._base_version_id}:{version_number}"
                 ),
-                version_number=version_number,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 base_version_id=self._base_version_id,
                 object_storage=ObjectStorageSource(
                     storage_type=self._object_storage_config.storage_type,
-                    uri=self._object_storage_config.root_uri(version_number),
+                    uri=object_storage_uri,
                 ),
                 state=WeightVersionState.STAGING,
             )

@@ -6,8 +6,8 @@ from argparse import Namespace
 import pytest
 import torch
 
-from slime.backends.megatron_utils.update_weight import update_weight_from_modelexpress as mx_module
 from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as distributed_module
+from slime.backends.megatron_utils.update_weight import update_weight_from_modelexpress as mx_module
 from slime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import UpdateWeightFromModelExpress
 
 pytestmark = pytest.mark.unit
@@ -41,7 +41,7 @@ class FakeControlClient:
 
     def create_weight_version(self, **kwargs):
         self.creates.append(kwargs)
-        version = FakeVersion(f"target-{kwargs['version_number']}", state="STAGING")
+        version = FakeVersion(kwargs["uid"], state="STAGING")
         self.versions[version.version_id] = version
         return version
 
@@ -159,8 +159,7 @@ def patch_runtime(monkeypatch):
             self.version_id = version_id
 
     class ObjectStorageConfig(types.SimpleNamespace):
-        def root_uri(self, version_number):
-            return f"{self.uri_prefix.rstrip('/')}/v{version_number}/model.safetensors.index.json"
+        pass
 
     class ObjectStorageSource(types.SimpleNamespace):
         pass
@@ -212,9 +211,7 @@ def updater(control=None, trainer=None, stub_gather=True):
     ("override", "expected"),
     [(None, 123), ("1024", 1024)],
 )
-def test_model_express_bucket_size_prefers_explicit_env(
-    monkeypatch, override, expected
-):
+def test_model_express_bucket_size_prefers_explicit_env(monkeypatch, override, expected):
     config = args()
     config.update_weight_buffer_size = 123
     if override is None:
@@ -317,9 +314,7 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
     assert events == []
     assert instance.weight_version == 0
 
-    clock = iter(
-        [0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0]
-    )
+    clock = iter([0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0])
     reductions = []
     monkeypatch.setattr(mx_module, "perf_counter", lambda: next(clock))
 
@@ -346,9 +341,9 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
     main = threading.current_thread().name
     assert control.creates == [
         {
+            "uid": "v1",
             "model_name": "policy",
             "idempotency_key": "slime:policy:base-uid:1",
-            "version_number": 1,
             "payload_format": "XOR_DELTA",
             "base_version_id": "base-uid",
             "object_storage": types.SimpleNamespace(
@@ -358,8 +353,8 @@ def test_slime_publishes_on_main_thread_and_activates_on_control_thread(monkeypa
             "state": "STAGING",
         }
     ]
-    assert control.state_updates == [("target-1", "READY")]
-    assert trainer.stages[0][0].version_id == "target-1"
+    assert control.state_updates == [("v1", "READY")]
+    assert trainer.stages[0][0].version_id == "v1"
     assert iter(trainer.stages[0][1]) is trainer.stages[0][1]
     assert trainer.stages[0][2] == main
     assert trainer.stages[0][3].publish_count == 1
@@ -406,13 +401,18 @@ def test_next_target_keeps_previous_version():
     instance._activation_executor.shutdown()
 
     assert len(control.creates) == 2
-    assert control.state_updates == [("target-1", "READY"), ("target-2", "READY")]
+    assert [create["object_storage"].uri for create in control.creates] == [
+        "s3://weights/run/policy/v1/model.safetensors.index.json",
+        "s3://weights/run/policy/v2/model.safetensors.index.json",
+    ]
+    assert [create["uid"] for create in control.creates] == ["v1", "v2"]
+    assert control.state_updates == [("v1", "READY"), ("v2", "READY")]
     assert len(trainer.stages) == 2
-    assert [event for event, _thread in events].count("install:target-1") == 1
-    assert [event for event, _thread in events].count("install:target-2") == 1
+    assert [event for event, _thread in events].count("install:v1") == 1
+    assert [event for event, _thread in events].count("install:v2") == 1
     assert control.deletes == []
     assert trainer.releases == []
-    assert instance._base_version_id == "target-2"
+    assert instance._base_version_id == "v2"
     assert instance.weight_version == 2
 
 
@@ -423,7 +423,7 @@ def test_receive_metrics_are_broadcast_to_the_logging_rank(monkeypatch):
     monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
     broadcasts = iter(
         [
-            FakeVersion("target-1", state="STAGING"),
+            FakeVersion("v1", state="STAGING"),
             {"perf/mx_receive_prepare_time": 7.0},
         ]
     )
@@ -498,7 +498,5 @@ def test_model_express_retains_expert_ep_gather_batching(monkeypatch):
 
     monkeypatch.setattr(instance, "_ep_gather_and_convert", gather_and_convert)
 
-    assert list(instance._iter_expert_chunks()) == [
-        [(f"hf.{name}", param) for name, param in experts]
-    ]
+    assert list(instance._iter_expert_chunks()) == [[(f"hf.{name}", param) for name, param in experts]]
     assert gathered == [("layer.experts.a", "layer.experts.b")]
