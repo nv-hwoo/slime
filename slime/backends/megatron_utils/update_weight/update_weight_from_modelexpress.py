@@ -51,7 +51,7 @@ _UPDATE_PHASE_METRICS = (
 
 
 class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
-    """Slime gather/control integration for ModelExpress S3/XOR refit."""
+    """Slime gather/control integration for ModelExpress S3 refit."""
 
     def __init__(
         self,
@@ -86,7 +86,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
             uri_prefix=args.modelexpress_s3_uri_prefix,
             endpoint_url=args.modelexpress_s3_endpoint,
             initial_base_version_id=self._base_version_id,
-            launch_checkpoint=args.hf_checkpoint,
+            seed_checkpoint_path=args.hf_checkpoint,
         )
         if control_client is None or trainer_client is None:
             from modelexpress_rl import (
@@ -186,20 +186,37 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDistributed):
         payload = [None]
         if dist.get_rank() == 0:
             version_number = self.weight_version + 1
+            full_checkpoint_interval = self.args.modelexpress_full_hf_checkpoint_interval
+            is_full_checkpoint = (
+                full_checkpoint_interval is not None
+                and version_number % full_checkpoint_interval == 0
+            )
+            object_storage_uri = (
+                f"{self._object_storage_config.uri_prefix.rstrip('/')}/v{version_number}/"
+                "model.safetensors.index.json"
+            )
+            version_kwargs = {}
+            if not is_full_checkpoint:
+                version_kwargs["base_version_id"] = self._base_version_id
             payload[0] = self._control_client.create_weight_version(
+                uid=f"{self.args.modelexpress_model_id}-v{version_number}",
                 model_name=self.args.modelexpress_model_id,
                 idempotency_key=(
                     f"slime:{self.args.modelexpress_model_id}:"
                     f"{self._base_version_id}:{version_number}"
                 ),
-                version_number=version_number,
-                payload_format=WeightPayloadFormat.XOR_DELTA,
-                base_version_id=self._base_version_id,
+
+                payload_format=(
+                    WeightPayloadFormat.FULL_HF_CHECKPOINT
+                    if is_full_checkpoint
+                    else WeightPayloadFormat.XOR_DELTA
+                ),
                 object_storage=ObjectStorageSource(
                     storage_type=self._object_storage_config.storage_type,
-                    uri=self._object_storage_config.root_uri(version_number),
+                    uri=object_storage_uri,
                 ),
                 state=WeightVersionState.STAGING,
+                **version_kwargs,
             )
         dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
         target = payload[0]

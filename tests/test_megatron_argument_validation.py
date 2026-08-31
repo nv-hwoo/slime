@@ -264,6 +264,7 @@ def make_slime_validate_args(**overrides):
         modelexpress_s3_uri_prefix=None,
         modelexpress_preparation_cache_dir=None,
         modelexpress_initial_version="0",
+        modelexpress_full_hf_checkpoint_interval=None,
         rollout_external=False,
         lora_rank=0,
         rollout_temperature=1.0,
@@ -450,6 +451,27 @@ def test_modelexpress_does_not_require_native_disk_configuration(monkeypatch):
 
     del args.lora_rank
     module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("interval", [True, "2", 2.5, 0, -1])
+def test_modelexpress_full_hf_checkpoint_interval_must_be_positive(monkeypatch, interval):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        update_weight_backend="modelexpress",
+        modelexpress_model_id="policy",
+        modelexpress_server_url="dns:///modelexpress:8001",
+        modelexpress_base_version_id="launch-ready-uid",
+        modelexpress_s3_uri_prefix="s3://weights/run/policy",
+        modelexpress_preparation_cache_dir="/mxdelta/mxprep",
+        modelexpress_full_hf_checkpoint_interval=interval,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="full-hf-checkpoint-interval must be a positive integer",
+    ):
+        module.slime_validate_args(args)
 
 
 if __name__ == "__main__":

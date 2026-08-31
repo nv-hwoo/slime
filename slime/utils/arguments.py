@@ -144,6 +144,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--modelexpress-preparation-cache-dir", type=str, default=None)
             parser.add_argument("--modelexpress-initial-version", type=str, default="0")
             parser.add_argument(
+                "--modelexpress-full-hf-checkpoint-interval",
+                type=int,
+                default=None,
+                help="Publish a full HF checkpoint every N ModelExpress weight versions. Disabled by default.",
+            )
+            parser.add_argument(
                 "--update-weight-mode",
                 choices=["full", "delta"],
                 default="full",
@@ -2075,6 +2081,15 @@ def slime_validate_args(args):
             raise ValueError("ModelExpress does not support LoRA weight updates")
         if args.modelexpress_initial_version != "0":
             raise ValueError("ModelExpress requires --modelexpress-initial-version=0")
+        full_checkpoint_interval = args.modelexpress_full_hf_checkpoint_interval
+        if full_checkpoint_interval is not None and (
+            isinstance(full_checkpoint_interval, bool)
+            or not isinstance(full_checkpoint_interval, int)
+            or full_checkpoint_interval <= 0
+        ):
+            raise ValueError(
+                "--modelexpress-full-hf-checkpoint-interval must be a positive integer"
+            )
         if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:
             raise ValueError("ModelExpress does not use native disk weight-update directories")
         if args.custom_update_weight_post_write_path:
